@@ -152,7 +152,16 @@ function App() {
   // VK Bridge status & VK User info
   const [vkBridgeReady, setVkBridgeReady] = useState(false);
   const [vkUser, setVkUser] = useState(null);
-  const [vkAppId, setVkAppId] = useState('51890000');
+  const [vkAppId, setVkAppId] = useState('54871400');
+  const [vkBotToken, setVkBotToken] = useState('');
+  const [vkChatPeerId, setVkChatPeerId] = useState('');
+  const [botSettingsOpen, setBotSettingsOpen] = useState(false);
+  const [deleteConfirmations, setDeleteConfirmations] = useState({
+    starosta: false,
+    deputy: false,
+  });
+  const [studentGroupBindings, setStudentGroupBindings] = useState({});
+  const [selectedStudentProfileId, setSelectedStudentProfileId] = useState(null);
 
   // Onboarding / Entry Flow state: 'entry' (role selection) | 'app' (inside mini-app)
   const [screenMode, setScreenMode] = useState('entry');
@@ -307,6 +316,12 @@ function App() {
             parsed.dailyAbsenceReasonByDay || EMPTY_DAILY_REASON
           );
           setAttendance(parsed.attendance || {});
+          setVkBotToken(parsed.vkBotToken || '');
+          setVkChatPeerId(parsed.vkChatPeerId || '');
+          setDeleteConfirmations(
+            parsed.deleteConfirmations || { starosta: false, deputy: false }
+          );
+          setStudentGroupBindings(parsed.studentGroupBindings || {});
           setCurrentAcademicWeekType(
             parsed.currentAcademicWeekType || 'numerator'
           );
@@ -381,6 +396,10 @@ function App() {
       dailyDeputyByDay,
       dailyAbsenceReasonByDay,
       attendance,
+      vkBotToken,
+      vkChatPeerId,
+      deleteConfirmations,
+      studentGroupBindings,
       currentAcademicWeekType,
     };
     try {
@@ -409,6 +428,10 @@ function App() {
     dailyDeputyByDay,
     dailyAbsenceReasonByDay,
     attendance,
+    vkBotToken,
+    vkChatPeerId,
+    deleteConfirmations,
+    studentGroupBindings,
     currentAcademicWeekType,
     vkBridgeReady,
   ]);
@@ -464,9 +487,17 @@ function App() {
     );
   };
 
-  const resetAllData = () => {
+  const resetAllData = (customMsg = 'Группа успешно удалена.') => {
     try {
       localStorage.removeItem(STORAGE_KEY);
+      if (vkBridgeReady && window.vkBridge) {
+        window.vkBridge
+          .send('VKWebAppStorageSet', {
+            key: STORAGE_KEY,
+            value: '',
+          })
+          .catch(() => {});
+      }
     } catch {
       // Ignore
     }
@@ -481,9 +512,145 @@ function App() {
     setDailyDeputyByDay(EMPTY_DAILY_DEPUTY);
     setDailyAbsenceReasonByDay(EMPTY_DAILY_REASON);
     setAttendance({});
+    setDeleteConfirmations({ starosta: false, deputy: false });
+    setStudentGroupBindings({});
+    setSelectedStudentProfileId(null);
     setEntryRoleStep('choose');
     setScreenMode('entry');
-    showToast('Все данные очищены. Вы можете создать новую группу с нуля.');
+    showToast(customMsg);
+  };
+
+  const handleToggleDeleteConfirmation = () => {
+    if (currentUser.role !== 'starosta' && currentUser.role !== 'deputy') {
+      showToast('Подтверждать удаление группы могут только староста и заместитель старосты.');
+      return;
+    }
+
+    if (currentUser.role === 'starosta') {
+      if (deleteConfirmations.starosta) {
+        setDeleteConfirmations((prev) => ({ ...prev, starosta: false }));
+        showToast('Подтверждение удаления группы со стороны старосты отменено.');
+        return;
+      }
+      if (deleteConfirmations.deputy) {
+        resetAllData('Староста и заместитель подтвердили удаление (2/2). Группа полностью удалена.');
+        return;
+      }
+      setDeleteConfirmations((prev) => ({ ...prev, starosta: true }));
+      showToast('Староста подтвердил(а) удаление (1/2). Группа удалится после подтверждения замстаросты.');
+    } else if (currentUser.role === 'deputy') {
+      if (deleteConfirmations.deputy) {
+        setDeleteConfirmations((prev) => ({ ...prev, deputy: false }));
+        showToast('Подтверждение удаления группы со стороны замстаросты отменено.');
+        return;
+      }
+      if (deleteConfirmations.starosta) {
+        resetAllData('Староста и заместитель подтвердили удаление (2/2). Группа полностью удалена.');
+        return;
+      }
+      setDeleteConfirmations((prev) => ({ ...prev, deputy: true }));
+      showToast('Замстаросты подтвердил(а) удаление (1/2). Группа удалится после подтверждения старосты.');
+    }
+  };
+
+  // Open Student Detailed Profile (Only the student themselves, Starosta, or Deputy Starosta can view)
+  const openStudentProfile = (memberId) => {
+    const canView =
+      currentUser.role === 'starosta' ||
+      currentUser.role === 'deputy' ||
+      currentUser.id === memberId;
+
+    if (!canView) {
+      showToast('Просматривать прогулы и личные данные студента могут только сам студент, староста и замстаросты.');
+      return;
+    }
+    setSelectedStudentProfileId(memberId);
+  };
+
+  // Delete student or Deputy Starosta (ONLY Starosta can do this)
+  const deleteMemberByStarosta = (memberId) => {
+    if (currentUser.role !== 'starosta') {
+      showToast('Удалять участников и заместителя старосты может только староста!');
+      return;
+    }
+    const target = members.find((m) => m.id === memberId);
+    if (!target) return;
+    if (target.role === 'starosta') {
+      showToast('Староста не может удалить сам себя.');
+      return;
+    }
+
+    setMembers((prev) => prev.filter((m) => m.id !== memberId));
+    setDailyDeputyByDay((prev) => {
+      const next = { ...prev };
+      Object.keys(next).forEach((dayKey) => {
+        if (next[dayKey] === memberId) next[dayKey] = null;
+      });
+      return next;
+    });
+    setQueues((prev) =>
+      prev.map((q) => ({
+        ...q,
+        entries: q.entries.filter((e) => e.userId !== memberId),
+      }))
+    );
+    setFunds((prev) =>
+      prev.map((f) => ({
+        ...f,
+        paidIds: f.paidIds.filter((id) => id !== memberId),
+      }))
+    );
+    setStudentGroupBindings((prev) => {
+      const next = { ...prev };
+      delete next[target.name.trim().toLowerCase()];
+      if (target.vkTag) delete next[target.vkTag.trim().toLowerCase()];
+      return next;
+    });
+    if (selectedStudentProfileId === memberId) {
+      setSelectedStudentProfileId(null);
+    }
+    if (currentUserId === memberId) {
+      setCurrentUserId('u1');
+    }
+    showToast(
+      target.role === 'deputy'
+        ? `Заместитель старосты ${target.name} удален(а) из группы.`
+        : `Студент ${target.name} удален(а) из группы.`
+    );
+  };
+
+  const assignNewDeputyByStarosta = (memberId) => {
+    if (currentUser.role !== 'starosta') {
+      showToast('Назначать заместителя старосты может только староста.');
+      return;
+    }
+    setMembers((prev) =>
+      prev.map((m) => {
+        if (m.role === 'starosta') return m;
+        if (m.id === memberId) {
+          return {
+            ...m,
+            role: 'deputy',
+            avatarColor: 'bg-purple-600',
+            permissions: {
+              canManageHomework: true,
+              canMarkAttendance: true,
+              canEditSchedule: true,
+              canManageQueues: true,
+              canPostAnnouncements: true,
+            },
+          };
+        }
+        if (m.role === 'deputy') {
+          return { ...m, role: 'member' };
+        }
+        return m;
+      })
+    );
+    const chosen = members.find((m) => m.id === memberId);
+    if (chosen) {
+      showToast(`${chosen.name} назначен(а) заместителем старосты.`);
+    }
   };
 
   // Permanent leaders (Fixed roles)
@@ -706,11 +873,39 @@ function App() {
       return;
     }
 
-    // If a group already exists on this instance, check code match
-    if (groupInfo && cleanEntered !== groupInfo.code.toUpperCase()) {
+    const normName = studentName.toLowerCase();
+    const normTag = studentJoinForm.studentVkTag.trim().toLowerCase();
+    const existingBoundCode =
+      studentGroupBindings[normName] ||
+      (normTag ? studentGroupBindings[normTag] : null);
+
+    // Check if student is already bound to another group
+    if (existingBoundCode && existingBoundCode.toUpperCase() !== cleanEntered) {
       setStudentJoinForm((prev) => ({
         ...prev,
-        error: `Неверный код группы. Проверьте код у старосты (код созданной группы: ${groupInfo.code}).`,
+        error: `Вы уже состоите в учебной группе с кодом «${existingBoundCode}». Студент может состоять только в одной группе и не может войти в другую.`,
+      }));
+      return;
+    }
+
+    // Also if current device already has an active group where this user is registered, block joining a second group code
+    if (groupInfo && cleanEntered !== groupInfo.code.toUpperCase()) {
+      const isAlreadyMemberHere = members.some(
+        (m) =>
+          m.name.trim().toLowerCase() === normName ||
+          (normTag && m.vkTag.trim().toLowerCase() === normTag) ||
+          m.role === 'member'
+      );
+      if (isAlreadyMemberHere) {
+        setStudentJoinForm((prev) => ({
+          ...prev,
+          error: `Вы уже состоите в группе «${groupInfo.name}» (${groupInfo.code}). Вступить во вторую группу нельзя, пока староста не исключит вас из текущей.`,
+        }));
+        return;
+      }
+      setStudentJoinForm((prev) => ({
+        ...prev,
+        error: `Группа с кодом «${cleanEntered}» недоступна, так как вы уже привязаны к группе «${groupInfo.name}» (${groupInfo.code}).`,
       }));
       return;
     }
@@ -759,6 +954,11 @@ function App() {
       showToast(`Вы успешно вступили в группу по коду ${cleanEntered}!`);
     }
 
+    setStudentGroupBindings((prev) => ({
+      ...prev,
+      [normName]: groupInfo ? groupInfo.code : cleanEntered,
+      ...(normTag ? { [normTag]: groupInfo ? groupInfo.code : cleanEntered } : {}),
+    }));
     setStudentJoinForm((prev) => ({ ...prev, error: '' }));
     setScreenMode('app');
   };
@@ -801,8 +1001,50 @@ function App() {
 
     setBotBroadcasts((prev) => [newBroadcast, ...prev]);
     setBroadcastInput({ title: '', text: '', urgent: true });
+
+    // Send via VK Bot API (JSONP) if community token is configured
+    const cleanToken = vkBotToken.trim();
+    if (cleanToken) {
+      const formattedVkText = `${newBroadcast.urgent ? '⚡ [ВАЖНО] ' : '📌 '}${newBroadcast.title}\n\n${newBroadcast.text}\n\n👤 Отправитель: ${newBroadcast.senderName} (${newBroadcast.senderRoleLabel})`;
+      const targets = new Set();
+      if (vkChatPeerId.trim()) {
+        const cleanPeer = vkChatPeerId.trim().replace(/\D/g, '');
+        if (cleanPeer) targets.add(cleanPeer);
+      }
+      members.forEach((m) => {
+        const rawTag = String(m.vkTag || '');
+        const matchId = rawTag.match(/(\d{5,15})/);
+        if (matchId && matchId[1]) {
+          targets.add(matchId[1]);
+        }
+      });
+
+      targets.forEach((peerId) => {
+        try {
+          const cbName = 'vkBotCb_' + Date.now() + '_' + Math.floor(Math.random() * 10000);
+          const script = document.createElement('script');
+          window[cbName] = () => {
+            delete window[cbName];
+            if (script.parentNode) script.parentNode.removeChild(script);
+          };
+          const params = new URLSearchParams({
+            peer_id: String(peerId),
+            random_id: String(Math.floor(Math.random() * 1e9)),
+            message: formattedVkText,
+            access_token: cleanToken,
+            v: '5.199',
+            callback: cbName,
+          });
+          script.src = `https://api.vk.com/method/messages.send?${params.toString()}`;
+          document.body.appendChild(script);
+        } catch {
+          // Ignore network error per recipient
+        }
+      });
+    }
+
     showToast(
-      `🤖 Отправлено от имени бота всем участникам группы (${members.length}/${members.length} чел.)!`
+      `🤖 Сообщение отправлено от имени бота всем участникам группы (${members.length}/${members.length} чел.)!`
     );
   };
 
@@ -969,7 +1211,7 @@ function App() {
       [dayId]: memberIdOrNull || null,
     }));
     if (!memberIdOrNull) {
-      showToast('Назначение на день снято. Плашка отсутствия скрыта.');
+      showToast('Назначение на выбранный день снято.');
     } else {
       const chosen = members.find((m) => m.id === memberIdOrNull);
       if (chosen) {
@@ -1161,7 +1403,7 @@ function App() {
                 Староста.ВК
               </span>
               <span className="ml-2 text-xs font-semibold px-2 py-0.5 rounded-full bg-[#2688EB]/15 text-[#2688EB]">
-                VK Mini Apps {vkBridgeReady ? '• VK Bridge подключен' : ''}
+                Органайзер группы
               </span>
             </div>
           </div>
@@ -1204,7 +1446,7 @@ function App() {
             >
               <div className="text-center space-y-2">
                 <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#2688EB]/10 text-[#2688EB] text-xs font-bold">
-                  <Sparkles className="w-3.5 h-3.5" /> Рабочая версия для ВКонтакте (без демо-данных)
+                  <Sparkles className="w-3.5 h-3.5" /> Управление учебной группой
                 </span>
                 <h1 className="text-xl sm:text-2xl font-extrabold">
                   Выберите вашу роль в группе
@@ -1274,13 +1516,7 @@ function App() {
                       onClick={() => setScreenMode('app')}
                       className="text-[#2688EB] font-bold hover:underline"
                     >
-                      Войти →
-                    </button>
-                    <button
-                      onClick={resetAllData}
-                      className="text-rose-500 font-semibold hover:underline"
-                    >
-                      Удалить группу
+                      Открыть группу →
                     </button>
                   </div>
                 </div>
@@ -1779,7 +2015,7 @@ function App() {
 
         {/* Footer info */}
         <div className="text-center text-xs text-slate-400">
-          Староста.ВК • Готово к публикации в VK Mini Apps
+          Староста.ВК • Учебное расписание и контроль группы
         </div>
 
         {/* Toast Notification */}
@@ -1853,13 +2089,7 @@ function App() {
 
           {/* Interactive Role Switcher, VK Deploy Button, Entry Screen Button & Theme */}
           <div className="flex items-center gap-2 flex-wrap">
-            <button
-              onClick={() => setVkDeployModalOpen(true)}
-              className="px-2.5 py-1.5 rounded-xl bg-[#2688EB] text-white text-xs font-semibold flex items-center gap-1.5 hover:bg-blue-600 shadow-xs"
-            >
-              <Terminal className="w-3.5 h-3.5" />
-              <span>Подключение к ВК</span>
-            </button>
+
 
             <button
               onClick={() => {
@@ -1945,7 +2175,7 @@ function App() {
         {/* Navigation Bar */}
         <div className="max-w-6xl mx-auto px-3 sm:px-5 flex items-center gap-1 overflow-x-auto no-scrollbar pb-2">
           {[
-            { id: 'dashboard', label: 'Сегодня & Рассылка бота', icon: Sparkles },
+            { id: 'dashboard', label: 'Сегодня & Сводка', icon: Sparkles },
             { id: 'schedule', label: 'Расписание + ДЗ на пару', icon: Calendar },
             {
               id: 'homework',
@@ -2090,7 +2320,7 @@ function App() {
                 <button
                   onClick={() => appointDailyDeputy(selectedDay, null)}
                   className="px-2.5 py-1.5 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 text-rose-600 dark:text-rose-300 text-xs font-semibold"
-                  title="Снять назначение (плашка исчезнет с экрана)"
+                  title="Снять назначение на этот день"
                 >
                   Снять назначение
                 </button>
@@ -2196,8 +2426,7 @@ function App() {
                       </span>
                     ) : (
                       <span>
-                        На {DAYS.find((d) => d.id === selectedDay)?.short} замена не
-                        назначалась (плашка скрыта)
+                        На {DAYS.find((d) => d.id === selectedDay)?.short} временная замена не назначена
                       </span>
                     )}
                   </div>
@@ -2240,39 +2469,105 @@ function App() {
               </div>
             </div>
 
-            {/* REQUIREMENT 4A: IMPORTANT MESSAGES WINDOW FOR STAROSTA & DEPUTY (BOT BROADCAST) */}
-            <div
-              className={`p-4 sm:p-5 rounded-2xl border-2 border-[#2688EB]/30 ${
-                darkMode
-                  ? 'bg-slate-900'
-                  : 'bg-gradient-to-r from-blue-50/60 via-white to-indigo-50/40 shadow-xs'
-              }`}
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                <div className="flex items-center gap-2.5">
-                  <div className="w-9 h-9 rounded-xl bg-[#2688EB] text-white flex items-center justify-center shrink-0">
-                    <Bot className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <h2 className="font-bold text-sm sm:text-base">
-                        Важные сообщения группы (Рассылка от имени бота ВК)
-                      </h2>
-                      <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-[#2688EB]/15 text-[#2688EB]">
-                        Получателей: {members.length} чел.
-                      </span>
+            {/* IMPORTANT MESSAGES WINDOW — VISIBLE ONLY TO STAROSTA & DEPUTY STAROSTA */}
+            {effectivePermissions.canSendBotBroadcast && (
+              <div
+                className={`p-4 sm:p-5 rounded-2xl border-2 border-[#2688EB]/30 ${
+                  darkMode
+                    ? 'bg-slate-900'
+                    : 'bg-gradient-to-r from-blue-50/60 via-white to-indigo-50/40 shadow-xs'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-9 h-9 rounded-xl bg-[#2688EB] text-white flex items-center justify-center shrink-0">
+                      <Bot className="w-5 h-5" />
                     </div>
-                    <p className="text-xs text-slate-500">
-                      Сообщения, отправленные старостой или заместителем старосты, рассылаются всем участникам группы от имени бота.
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h2 className="font-bold text-sm sm:text-base">
+                          Важные сообщения (Рассылка от имени бота ВК)
+                        </h2>
+                        <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-[#2688EB]/15 text-[#2688EB]">
+                          Видно только старосте и замстаросты • Получателей: {members.length} чел.
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-500">
+                        Отправленные здесь сообщения рассылаются всем участникам группы от имени бота ВКонтакте.
+                      </p>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => setBotSettingsOpen(!botSettingsOpen)}
+                    className={`px-3 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition ${
+                      vkBotToken.trim()
+                        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                        : darkMode
+                        ? 'border-slate-700 bg-slate-800 text-slate-300'
+                        : 'border-slate-200 bg-white text-slate-700'
+                    }`}
+                  >
+                    <Bot className="w-3.5 h-3.5" />
+                    <span>{vkBotToken.trim() ? 'Бот ВК подключен' : 'Настроить токен бота ВК'}</span>
+                  </button>
+                </div>
+
+                {botSettingsOpen && (
+                  <div
+                    className={`mb-4 p-3.5 rounded-xl border space-y-2.5 text-xs ${
+                      darkMode
+                        ? 'bg-slate-800/90 border-slate-700'
+                        : 'bg-white border-blue-200'
+                    }`}
+                  >
+                    <div className="font-bold text-[#2688EB]">
+                      Подключение бота сообщества ВКонтакте для авто-рассылки
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="block font-semibold mb-1 text-slate-500">
+                          Ключ доступа сообщества ВК (Токен бота):
+                        </label>
+                        <input
+                          type="password"
+                          value={vkBotToken}
+                          onChange={(e) => setVkBotToken(e.target.value)}
+                          placeholder="vk1.a.Ваш_токен_сообщества..."
+                          className={`w-full px-3 py-2 rounded-lg border ${
+                            darkMode
+                              ? 'bg-slate-900 border-slate-700'
+                              : 'bg-slate-50 border-slate-200'
+                          }`}
+                        />
+                      </div>
+                      <div>
+                        <label className="block font-semibold mb-1 text-slate-500">
+                          Peer ID беседы группы (необязательно, например 2000000001):
+                        </label>
+                        <input
+                          type="text"
+                          value={vkChatPeerId}
+                          onChange={(e) => setVkChatPeerId(e.target.value)}
+                          placeholder="2000000001 или ID диалога"
+                          className={`w-full px-3 py-2 rounded-lg border ${
+                            darkMode
+                              ? 'bg-slate-900 border-slate-700'
+                              : 'bg-slate-50 border-slate-200'
+                          }`}
+                        />
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      Токен создается в настройках вашего сообщества ВК: «Управление» → «Работа с API» → «Ключи доступа» (с правом доступа к сообщениям сообщества).
                     </p>
                   </div>
-                </div>
-              </div>
+                )}
 
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
-                {/* Left: Send form (only for Starosta and Permanent Deputy) */}
-                <div className="lg:col-span-5">
-                  {effectivePermissions.canSendBotBroadcast ? (
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
+                  {/* Left: Send form */}
+                  <div className="lg:col-span-5">
                     <form
                       onSubmit={handleSendBotBroadcast}
                       className={`p-3.5 rounded-xl border space-y-2.5 ${
@@ -2348,79 +2643,64 @@ function App() {
                         </button>
                       </div>
                     </form>
-                  ) : (
-                    <div
-                      className={`p-4 rounded-xl border h-full flex flex-col justify-center text-xs space-y-2 ${
-                        darkMode
-                          ? 'bg-slate-800/40 border-slate-800 text-slate-400'
-                          : 'bg-slate-50 border-slate-200 text-slate-600'
-                      }`}
-                    >
-                      <div className="font-bold flex items-center gap-1.5 text-slate-700 dark:text-slate-200">
-                        <Lock className="w-4 h-4 text-[#2688EB]" /> Доступно старосте и заместителю
-                      </div>
-                      <p>
-                        Отправлять важные сообщения от имени бота могут только староста ({permanentStarostaMember.name}) и заместитель старосты ({permanentDeputyMember.name}).
-                      </p>
-                    </div>
-                  )}
-                </div>
+                  </div>
 
-                {/* Right: Feed of Bot Broadcasts sent to all members */}
-                <div className="lg:col-span-7 space-y-2.5 max-h-[250px] overflow-y-auto pr-1">
-                  {botBroadcasts.length === 0 ? (
-                    <div
-                      className={`p-6 rounded-xl border border-dashed text-center text-xs ${
-                        darkMode
-                          ? 'border-slate-800 text-slate-500'
-                          : 'border-slate-200 text-slate-400'
-                      }`}
-                    >
-                      Важных рассылок от имени бота пока нет. Когда староста или замстаросты отправят сообщение, оно появится здесь и разошлется группе.
-                    </div>
-                  ) : (
-                    botBroadcasts.map((msg) => (
+                  {/* Right: Feed of Bot Broadcasts sent to all members */}
+                  <div className="lg:col-span-7 space-y-2.5 max-h-[250px] overflow-y-auto pr-1">
+                    {botBroadcasts.length === 0 ? (
                       <div
-                        key={msg.id}
-                        className={`p-3.5 rounded-xl border ${
+                        className={`p-6 rounded-xl border border-dashed text-center text-xs ${
                           darkMode
-                            ? 'bg-slate-800/80 border-slate-700'
-                            : 'bg-white border-slate-200/90'
+                            ? 'border-slate-800 text-slate-500'
+                            : 'border-slate-200 text-slate-400'
                         }`}
                       >
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#2688EB] text-white text-[10px] font-bold">
-                              <Bot className="w-3 h-3" /> Бот Староста.ВК
-                            </span>
-                            {msg.urgent && (
-                              <span className="px-2 py-0.5 rounded-md bg-rose-500/15 text-rose-600 dark:text-rose-400 text-[10px] font-bold">
-                                ВАЖНО
+                        Отправленных рассылок пока нет. Напишите сообщение слева, чтобы разослать его участникам группы от имени бота.
+                      </div>
+                    ) : (
+                      botBroadcasts.map((msg) => (
+                        <div
+                          key={msg.id}
+                          className={`p-3.5 rounded-xl border ${
+                            darkMode
+                              ? 'bg-slate-800/80 border-slate-700'
+                              : 'bg-white border-slate-200/90'
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#2688EB] text-white text-[10px] font-bold">
+                                <Bot className="w-3 h-3" /> Бот Староста.ВК
                               </span>
-                            )}
-                            <span className="font-bold text-xs sm:text-sm">
-                              {msg.title}
+                              {msg.urgent && (
+                                <span className="px-2 py-0.5 rounded-md bg-rose-500/15 text-rose-600 dark:text-rose-400 text-[10px] font-bold">
+                                  ВАЖНО
+                                </span>
+                              )}
+                              <span className="font-bold text-xs sm:text-sm">
+                                {msg.title}
+                              </span>
+                            </div>
+                            <span className="text-[11px] text-emerald-600 dark:text-emerald-400 font-semibold">
+                              ✓ Разослано всем ({msg.deliveredCount}/{members.length} чел.)
                             </span>
                           </div>
-                          <span className="text-[11px] text-emerald-600 dark:text-emerald-400 font-semibold">
-                            ✓ Разослано всем ({msg.deliveredCount}/{members.length} чел.)
-                          </span>
-                        </div>
 
-                        <p className="text-xs mt-1.5 leading-relaxed">{msg.text}</p>
+                          <p className="text-xs mt-1.5 leading-relaxed">{msg.text}</p>
 
-                        <div className="flex items-center justify-between mt-2 text-[11px] text-slate-400">
-                          <span>
-                            Отправитель: <strong>{msg.senderName}</strong> ({msg.senderRoleLabel})
-                          </span>
-                          <span>{msg.time}</span>
+                          <div className="flex items-center justify-between mt-2 text-[11px] text-slate-400">
+                            <span>
+                              Отправитель: <strong>{msg.senderName}</strong> ({msg.senderRoleLabel})
+                            </span>
+                            <span>{msg.time}</span>
+                          </div>
                         </div>
-                      </div>
-                    ))
-                  )}
+                      ))
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
+            )}
 
             {/* Two-column layout: Today's Schedule + Next Week Homework Preview */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
@@ -3573,7 +3853,7 @@ function App() {
               <div className="flex flex-wrap items-start justify-between gap-3 mb-3">
                 <div>
                   <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#2688EB] text-white text-[11px] font-bold mb-1.5">
-                    <BookOpen className="w-3.5 h-3.5" /> СПЕЦИАЛЬНАЯ ПЛАШКА ДОСТУПА К ДЗ
+                    <BookOpen className="w-3.5 h-3.5" /> ДОСТУП К ДОМАШНИМ ЗАДАНИЯМ
                   </div>
                   <h2 className="text-base sm:text-lg font-bold">
                     Кто может добавлять, изменять и удалять домашние задания
@@ -3754,32 +4034,87 @@ function App() {
                     </span>
                   </div>
 
-                  <div
-                    className={`p-3 rounded-xl border flex items-center justify-between ${
-                      darkMode
-                        ? 'bg-slate-800/60 border-slate-700'
-                        : 'bg-purple-50/50 border-purple-200/80'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2.5">
+                  {permanentDeputyMember.id !== 'deputy_placeholder' ? (
+                    <div
+                      className={`p-3 rounded-xl border flex items-center justify-between gap-2 ${
+                        darkMode
+                          ? 'bg-slate-800/60 border-slate-700'
+                          : 'bg-purple-50/50 border-purple-200/80'
+                      }`}
+                    >
                       <div
-                        className={`w-9 h-9 rounded-full text-white font-bold flex items-center justify-center ${permanentDeputyMember.avatarColor}`}
+                        onClick={() => openStudentProfile(permanentDeputyMember.id)}
+                        className="flex items-center gap-2.5 cursor-pointer hover:opacity-80"
                       >
-                        {permanentDeputyMember.name[0]}
+                        <div
+                          className={`w-9 h-9 rounded-full text-white font-bold flex items-center justify-center ${permanentDeputyMember.avatarColor}`}
+                        >
+                          {permanentDeputyMember.name[0]}
+                        </div>
+                        <div>
+                          <div className="font-bold text-xs sm:text-sm underline decoration-dotted">
+                            {permanentDeputyMember.name}
+                          </div>
+                          <div className="text-[11px] text-slate-500">
+                            {permanentDeputyMember.vkTag} • Заместитель старосты
+                          </div>
+                        </div>
                       </div>
-                      <div>
-                        <div className="font-bold text-xs sm:text-sm">
-                          {permanentDeputyMember.name}
-                        </div>
-                        <div className="text-[11px] text-slate-500">
-                          {permanentDeputyMember.vkTag} • Постоянный заместитель
-                        </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="px-2.5 py-1 rounded-lg bg-purple-600 text-white text-xs font-bold">
+                          Замстаросты
+                        </span>
+                        {currentUser.role === 'starosta' && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              deleteMemberByStarosta(permanentDeputyMember.id)
+                            }
+                            className="p-1.5 rounded-lg bg-rose-500/15 text-rose-600 hover:bg-rose-500/25 transition"
+                            title="Удалить заместителя старосты (доступно только старосте)"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
                       </div>
                     </div>
-                    <span className="px-2.5 py-1 rounded-lg bg-purple-600 text-white text-xs font-bold">
-                      Замстаросты
-                    </span>
-                  </div>
+                  ) : (
+                    <div
+                      className={`p-3 rounded-xl border border-dashed text-xs space-y-2 ${
+                        darkMode
+                          ? 'border-slate-700 text-slate-400'
+                          : 'border-purple-300 text-slate-600'
+                      }`}
+                    >
+                      <div>Заместитель старосты удален или не назначен.</div>
+                      {currentUser.role === 'starosta' &&
+                        members.filter((m) => m.role !== 'starosta').length > 0 && (
+                          <select
+                            defaultValue=""
+                            onChange={(e) => {
+                              if (e.target.value)
+                                assignNewDeputyByStarosta(e.target.value);
+                            }}
+                            className={`w-full px-2.5 py-1.5 rounded-lg border font-semibold ${
+                              darkMode
+                                ? 'bg-slate-800 border-slate-700 text-white'
+                                : 'bg-white border-slate-200 text-slate-900'
+                            }`}
+                          >
+                            <option value="">
+                              + Назначить нового замстаросты из группы...
+                            </option>
+                            {members
+                              .filter((m) => m.role !== 'starosta')
+                              .map((m) => (
+                                <option key={m.id} value={m.id}>
+                                  {m.name} ({m.subgroup} подгр.)
+                                </option>
+                              ))}
+                          </select>
+                        )}
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -3804,7 +4139,7 @@ function App() {
                   </button>
                 </div>
                 <p className="text-xs text-slate-500">
-                  Если староста или её заместитель отсутствуют, староста назначает ответственного на день. Плашка отсутствия появляется на экране <strong>только если кто-то назначен</strong>.
+                  Если староста или заместитель отсутствуют, староста может выбрать ответственного на конкретный учебный день.
                 </p>
 
                 <div className="grid grid-cols-6 gap-1">
@@ -3849,7 +4184,7 @@ function App() {
                       }`}
                     >
                       <option value="">
-                        — Никто не назначен (плашка на экране скрыта) —
+                        — Никто не назначен —
                       </option>
                       {members
                         .filter(
@@ -3866,7 +4201,7 @@ function App() {
                   {dailyDeputyByDay[selectedDay] && (
                     <div>
                       <label className="block font-semibold mb-1">
-                        Причина назначения (отображается на плашке):
+                        Причина назначения:
                       </label>
                       <select
                         value={
@@ -3978,6 +4313,11 @@ function App() {
                       <th className="py-2.5 px-2 text-center">Расписание</th>
                       <th className="py-2.5 px-2 text-center">Очереди на лабы</th>
                       <th className="py-2.5 px-2 text-center">Объявления</th>
+                      {currentUser.role === 'starosta' && (
+                        <th className="py-2.5 px-2 text-center text-rose-500">
+                          Удаление
+                        </th>
+                      )}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200/60 dark:divide-slate-800">
@@ -3985,18 +4325,27 @@ function App() {
                       const isStarosta = m.role === 'starosta';
                       return (
                         <tr key={m.id}>
-                          <td className="py-2.5 px-2 font-semibold flex items-center gap-2">
-                            <span
-                              className={`w-7 h-7 rounded-full text-white text-xs font-bold flex items-center justify-center shrink-0 ${m.avatarColor}`}
+                          <td className="py-2.5 px-2 font-semibold">
+                            <button
+                              type="button"
+                              onClick={() => openStudentProfile(m.id)}
+                              className="flex items-center gap-2 text-left hover:text-[#2688EB] transition group"
+                              title="Нажмите, чтобы посмотреть прогулы и все данные участника"
                             >
-                              {m.name[0]}
-                            </span>
-                            <div>
-                              <div>{m.name}</div>
-                              <div className="text-[11px] text-slate-400 font-normal">
-                                {m.vkTag} • {m.subgroup} подгр.
+                              <span
+                                className={`w-7 h-7 rounded-full text-white text-xs font-bold flex items-center justify-center shrink-0 ${m.avatarColor}`}
+                              >
+                                {m.name[0]}
+                              </span>
+                              <div>
+                                <div className="underline decoration-dotted group-hover:text-[#2688EB]">
+                                  {m.name}
+                                </div>
+                                <div className="text-[11px] text-slate-400 font-normal">
+                                  {m.vkTag} • {m.subgroup} подгр. • Профиль и прогулы
+                                </div>
                               </div>
-                            </div>
+                            </button>
                           </td>
                           <td className="py-2.5 px-2">
                             <span
@@ -4049,6 +4398,22 @@ function App() {
                               </td>
                             );
                           })}
+                          {currentUser.role === 'starosta' && (
+                            <td className="py-2.5 px-2 text-center">
+                              {!isStarosta ? (
+                                <button
+                                  type="button"
+                                  onClick={() => deleteMemberByStarosta(m.id)}
+                                  className="px-2 py-1 rounded-lg bg-rose-500/10 text-rose-600 hover:bg-rose-500/20 text-xs font-semibold inline-flex items-center gap-1"
+                                  title="Удалить из группы (доступно только старосте)"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" /> Удалить
+                                </button>
+                              ) : (
+                                <span className="text-[11px] text-slate-400">—</span>
+                              )}
+                            </td>
+                          )}
                         </tr>
                       );
                     })}
@@ -4056,6 +4421,111 @@ function App() {
                 </table>
               </div>
             </div>
+
+            {/* TWO-FACTOR GROUP DELETION (REQUIRES BOTH STAROSTA AND DEPUTY CONFIRMATION) */}
+            {(currentUser.role === 'starosta' || currentUser.role === 'deputy') && (
+              <div
+                className={`p-4 sm:p-5 rounded-2xl border-2 border-rose-500/30 ${
+                  darkMode
+                    ? 'bg-rose-950/20'
+                    : 'bg-rose-50/40 shadow-xs'
+                }`}
+              >
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div className="space-y-1 max-w-xl">
+                    <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-rose-500/15 text-rose-600 dark:text-rose-400 text-[11px] font-bold">
+                      <Trash2 className="w-3.5 h-3.5" /> Двухэтапное удаление учебной группы
+                    </div>
+                    <h3 className="font-bold text-sm sm:text-base">
+                      Удаление группы «{groupInfo?.name}»
+                    </h3>
+                    <p className="text-xs text-slate-500">
+                      В целях безопасности удалить группу в одиночку нельзя. Группа будет удалена только после того, как и <strong>староста</strong>, и <strong>заместитель старосты</strong> оба нажмут кнопку подтверждения удаления.
+                    </p>
+
+                    <div className="flex flex-wrap items-center gap-2 pt-2 text-xs">
+                      <div
+                        className={`px-3 py-1.5 rounded-xl border font-semibold flex items-center gap-1.5 ${
+                          deleteConfirmations.starosta
+                            ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                            : darkMode
+                            ? 'border-slate-700 bg-slate-800 text-slate-400'
+                            : 'border-slate-200 bg-white text-slate-600'
+                        }`}
+                      >
+                        {deleteConfirmations.starosta ? (
+                          <Check className="w-3.5 h-3.5" />
+                        ) : (
+                          <Clock className="w-3.5 h-3.5" />
+                        )}
+                        <span>
+                          Староста ({permanentStarostaMember.name}):{' '}
+                          {deleteConfirmations.starosta
+                            ? 'Подтверждено'
+                            : 'Ожидается подтверждение'}
+                        </span>
+                      </div>
+
+                      <div
+                        className={`px-3 py-1.5 rounded-xl border font-semibold flex items-center gap-1.5 ${
+                          deleteConfirmations.deputy
+                            ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                            : darkMode
+                            ? 'border-slate-700 bg-slate-800 text-slate-400'
+                            : 'border-slate-200 bg-white text-slate-600'
+                        }`}
+                      >
+                        {deleteConfirmations.deputy ? (
+                          <Check className="w-3.5 h-3.5" />
+                        ) : (
+                          <Clock className="w-3.5 h-3.5" />
+                        )}
+                        <span>
+                          Замстаросты ({permanentDeputyMember.name}):{' '}
+                          {deleteConfirmations.deputy
+                            ? 'Подтверждено'
+                            : 'Ожидается подтверждение'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col items-end gap-2">
+                    <button
+                      type="button"
+                      onClick={handleToggleDeleteConfirmation}
+                      className={`px-4 py-2.5 rounded-xl text-xs font-bold flex items-center gap-1.5 transition shadow-xs ${
+                        (currentUser.role === 'starosta' &&
+                          deleteConfirmations.starosta) ||
+                        (currentUser.role === 'deputy' &&
+                          deleteConfirmations.deputy)
+                          ? 'bg-slate-600 hover:bg-slate-700 text-white'
+                          : 'bg-rose-600 hover:bg-rose-700 text-white'
+                      }`}
+                    >
+                      <Trash2 className="w-4 h-4" />
+                      {currentUser.role === 'starosta'
+                        ? deleteConfirmations.starosta
+                          ? 'Отменить подтверждение старосты'
+                          : deleteConfirmations.deputy
+                          ? 'Подтвердить и удалить группу (2/2)'
+                          : 'Удалить группу (подтвердить как Староста 1/2)'
+                        : deleteConfirmations.deputy
+                        ? 'Отменить подтверждение замстаросты'
+                        : deleteConfirmations.starosta
+                        ? 'Подтвердить и удалить группу (2/2)'
+                        : 'Удалить группу (подтвердить как Замстаросты 1/2)'}
+                    </button>
+                    <span className="text-[11px] text-slate-400">
+                      Подтверждено:{' '}
+                      {(deleteConfirmations.starosta ? 1 : 0) +
+                        (deleteConfirmations.deputy ? 1 : 0)}{' '}
+                      из 2
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -4153,7 +4623,11 @@ function App() {
                             : 'bg-slate-50/70 border-slate-200/70'
                         }`}
                       >
-                        <div className="flex items-center gap-2.5">
+                        <div
+                          onClick={() => openStudentProfile(m.id)}
+                          className="flex items-center gap-2.5 cursor-pointer hover:opacity-80"
+                          title="Открыть карточку прогулов и данных студента"
+                        >
                           <span
                             className={`w-7 h-7 rounded-full text-white text-xs font-bold flex items-center justify-center ${m.avatarColor}`}
                           >
@@ -4161,7 +4635,7 @@ function App() {
                           </span>
                           <div>
                             <div className="font-bold text-xs sm:text-sm flex items-center gap-1.5">
-                              <span>{m.name}</span>
+                              <span className="underline decoration-dotted">{m.name}</span>
                               {m.role === 'starosta' && (
                                 <span className="text-[10px] px-1.5 py-0.2 rounded bg-blue-500/15 text-[#2688EB]">
                                   Староста
@@ -4525,124 +4999,6 @@ function App() {
           </div>
         )}
       </main>
-
-      {/* ==================== MODAL: VK DEPLOY & BOT CONNECTION ==================== */}
-      {vkDeployModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
-          <div
-            className={`w-full max-w-2xl rounded-2xl border p-5 space-y-4 max-h-[90vh] overflow-y-auto ${
-              darkMode
-                ? 'bg-slate-900 border-slate-800 text-white'
-                : 'bg-white border-slate-200 text-slate-900'
-            }`}
-          >
-            <div className="flex items-center justify-between">
-              <h3 className="font-bold text-base flex items-center gap-2">
-                <Terminal className="w-5 h-5 text-[#2688EB]" />
-                Перенос и публикация в ВКонтакте (VK Mini Apps + Бот)
-              </h3>
-              <button
-                onClick={() => setVkDeployModalOpen(false)}
-                className="p-1 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs sm:text-sm">
-              <div
-                className={`p-3.5 rounded-xl border flex items-center justify-between gap-2 ${
-                  darkMode
-                    ? 'bg-slate-800 border-slate-700'
-                    : 'bg-blue-50/70 border-blue-200'
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
-                  <span>
-                    Все демонстрационные данные удалены. Приложение интегрировано с <strong>@vkontakte/vk-bridge</strong> и сохраняет данные в <strong>VK Storage</strong>.
-                  </span>
-                </div>
-              </div>
-
-              <div>
-                <label className="block font-bold mb-1">
-                  Ваш ID мини-приложения ВК (App ID из dev.vk.com):
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={vkAppId}
-                    onChange={(e) => {
-                      const val = e.target.value.replace(/\D/g, '') || '51890000';
-                      setVkAppId(val);
-                      if (groupInfo) {
-                        setGroupInfo({
-                          ...groupInfo,
-                          inviteLink: `https://vk.com/app${val}#join=${groupInfo.code}`,
-                        });
-                      }
-                    }}
-                    placeholder="Например: 51890000"
-                    className={`flex-1 px-3 py-2 rounded-xl border font-bold ${
-                      darkMode
-                        ? 'bg-slate-800 border-slate-700'
-                        : 'bg-slate-50 border-slate-200'
-                    }`}
-                  />
-                  <span className="text-xs text-slate-400">
-                    Ссылка: vk.com/app{vkAppId}
-                  </span>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <div className="font-bold">
-                  Пошаговый запуск в ВК за 3 минуты (из готового архива проекта):
-                </div>
-                <ol className="list-decimal list-inside space-y-1.5 text-xs text-slate-600 dark:text-slate-300">
-                  <li>
-                    Зайдите на <strong>dev.vk.com</strong> → «Мои приложения» → «Создать» → выберите <strong>Мини-приложение</strong> и скопируйте его <strong>ID приложения</strong>.
-                  </li>
-                  <li>
-                    Скачайте приложенный архив проекта <code>starosta_vk_mini_app.zip</code>, распакуйте и укажите ваш <code>app_id</code> в файле <code>vk-hosting-config.json</code>.
-                  </li>
-                  <li>
-                    Выполните в терминале команды:
-                    <pre
-                      className={`mt-1 p-2.5 rounded-xl border font-mono text-[11px] ${
-                        darkMode
-                          ? 'bg-slate-950 border-slate-800 text-emerald-400'
-                          : 'bg-slate-900 text-emerald-400'
-                      }`}
-                    >
-                      {`npm install\nnpm run build\nnpx vk-miniapps-deploy`}
-                    </pre>
-                  </li>
-                  <li>
-                    Для работы рассылки от имени бота в беседу и ЛС группы запустите сервер бота из папки <code>bot_server/</code>, указав токен вашего сообщества ВК (<code>VK_GROUP_TOKEN</code>).
-                  </li>
-                </ol>
-              </div>
-            </div>
-
-            <div className="flex items-center justify-between pt-2 border-t border-slate-200 dark:border-slate-800">
-              <button
-                onClick={resetAllData}
-                className="px-3 py-2 rounded-xl bg-rose-500/10 text-rose-500 hover:bg-rose-500/20 text-xs font-semibold flex items-center gap-1.5"
-              >
-                <RefreshCw className="w-3.5 h-3.5" /> Сбросить все данные приложения
-              </button>
-              <button
-                onClick={() => setVkDeployModalOpen(false)}
-                className="px-4 py-2 rounded-xl bg-[#2688EB] text-white text-xs font-bold"
-              >
-                Готово
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* ==================== MODAL: GROUP CODE & INVITE LINK ==================== */}
       {inviteModalOpen && groupInfo && (
@@ -5253,6 +5609,15 @@ function App() {
                     },
                   };
                   setMembers((prev) => [...prev, added]);
+                  if (groupInfo?.code) {
+                    const nKey = added.name.trim().toLowerCase();
+                    const tKey = added.vkTag.trim().toLowerCase();
+                    setStudentGroupBindings((prev) => ({
+                      ...prev,
+                      [nKey]: groupInfo.code,
+                      ...(tKey ? { [tKey]: groupInfo.code } : {}),
+                    }));
+                  }
                   setNewMemberModal({
                     open: false,
                     name: '',
@@ -5464,6 +5829,265 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* ==================== MODAL: STUDENT PROFILE, ABSENCES & DATA ==================== */}
+      {selectedStudentProfileId &&
+        (currentUser.role === 'starosta' ||
+          currentUser.role === 'deputy' ||
+          currentUser.id === selectedStudentProfileId) && (() => {
+          const student = members.find((m) => m.id === selectedStudentProfileId);
+          if (!student) return null;
+
+          const studentScheduleStats = schedule.map((pair) => {
+            const st = attendance[`${pair.id}_${student.id}`] || 'present';
+            return { pair, status: st };
+          });
+
+          const absentList = studentScheduleStats.filter((x) => x.status === 'absent');
+          const lateList = studentScheduleStats.filter((x) => x.status === 'late');
+          const excusedList = studentScheduleStats.filter((x) => x.status === 'excused');
+          const presentList = studentScheduleStats.filter((x) => x.status === 'present');
+
+          const completedHws = homeworks.filter((hw) =>
+            hw.completedBy.includes(student.id)
+          );
+          const assignedDays = DAYS.filter(
+            (d) => dailyDeputyByDay[d.id] === student.id
+          );
+          const studentQueues = queues.filter((q) =>
+            q.entries.some((e) => e.userId === student.id)
+          );
+          const studentPaidFunds = funds.filter((f) =>
+            f.paidIds.includes(student.id)
+          );
+
+          return (
+            <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
+              <div
+                className={`w-full max-w-2xl rounded-2xl border p-5 space-y-4 max-h-[90vh] overflow-y-auto ${
+                  darkMode
+                    ? 'bg-slate-900 border-slate-800 text-white'
+                    : 'bg-white border-slate-200 text-slate-900'
+                }`}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <div
+                      className={`w-12 h-12 rounded-2xl text-white font-bold text-lg flex items-center justify-center shrink-0 ${student.avatarColor}`}
+                    >
+                      {student.name[0]}
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h3 className="font-bold text-base sm:text-lg">
+                          {student.name}
+                        </h3>
+                        <span
+                          className={`text-[11px] px-2 py-0.5 rounded-full font-bold ${
+                            student.role === 'starosta'
+                              ? 'bg-blue-500/15 text-[#2688EB]'
+                              : student.role === 'deputy'
+                              ? 'bg-purple-500/15 text-purple-500'
+                              : 'bg-slate-500/15 text-slate-500'
+                          }`}
+                        >
+                          {student.role === 'starosta'
+                            ? 'Староста группы'
+                            : student.role === 'deputy'
+                            ? 'Заместитель старосты'
+                            : 'Студент группы'}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        Личная карточка участника • Доступна только самому студенту, старосте и замстаросты
+                      </p>
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => setSelectedStudentProfileId(null)}
+                    className="p-1.5 rounded-lg hover:bg-slate-200 dark:hover:bg-slate-800"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                {/* All entered student data */}
+                <div
+                  className={`p-3.5 rounded-xl border grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs ${
+                    darkMode
+                      ? 'bg-slate-800/60 border-slate-700'
+                      : 'bg-slate-50 border-slate-200'
+                  }`}
+                >
+                  <div>
+                    <div className="text-slate-400">Профиль ВК:</div>
+                    <div className="font-bold mt-0.5">{student.vkTag || 'Не указан'}</div>
+                  </div>
+                  <div>
+                    <div className="text-slate-400">Подгруппа:</div>
+                    <div className="font-bold mt-0.5">{student.subgroup}-я подгруппа</div>
+                  </div>
+                  <div>
+                    <div className="text-slate-400">Закрепленная группа:</div>
+                    <div className="font-bold mt-0.5 text-[#2688EB]">
+                      {groupInfo?.name} ({groupInfo?.code})
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-slate-400">Дежурства (Зам на день):</div>
+                    <div className="font-bold mt-0.5">
+                      {assignedDays.length > 0
+                        ? assignedDays.map((d) => d.short).join(', ')
+                        : 'Нет назначений'}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Attendance & Truancy (Прогулы) Summary */}
+                <div className="space-y-2.5">
+                  <h4 className="font-bold text-xs sm:text-sm uppercase tracking-wider text-slate-400">
+                    Статистика посещаемости и прогулов
+                  </h4>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+                    <div className="p-3 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-400">
+                      <div className="font-bold text-lg">
+                        {absentList.length} пар ({absentList.length * 2} ч.)
+                      </div>
+                      <div className="font-medium">Прогулы (Н)</div>
+                    </div>
+                    <div className="p-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                      <div className="font-bold text-lg">{lateList.length}</div>
+                      <div className="font-medium">Опоздания</div>
+                    </div>
+                    <div className="p-3 rounded-xl border border-blue-500/30 bg-blue-500/10 text-blue-600 dark:text-blue-400">
+                      <div className="font-bold text-lg">{excusedList.length}</div>
+                      <div className="font-medium">Уважительные</div>
+                    </div>
+                    <div className="p-3 rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                      <div className="font-bold text-lg">{presentList.length}</div>
+                      <div className="font-medium">Присутствовал(а)</div>
+                    </div>
+                  </div>
+
+                  {/* Detailed list of classes and marks */}
+                  {schedule.length > 0 && (
+                    <div
+                      className={`p-3 rounded-xl border max-h-48 overflow-y-auto space-y-1.5 text-xs ${
+                        darkMode
+                          ? 'bg-slate-800/40 border-slate-700'
+                          : 'bg-slate-50 border-slate-200'
+                      }`}
+                    >
+                      {studentScheduleStats.map(({ pair, status }) => (
+                        <div
+                          key={pair.id}
+                          className="flex items-center justify-between gap-2 py-1 border-b last:border-b-0 border-slate-200/60 dark:border-slate-700/60"
+                        >
+                          <div>
+                            <span className="font-semibold text-[#2688EB]">
+                              [{pair.weekType === 'numerator' ? 'Числ.' : 'Знам.'} •{' '}
+                              {DAYS.find((d) => d.id === pair.day)?.short}]
+                            </span>{' '}
+                            <span className="font-medium">{pair.subject}</span>{' '}
+                            <span className="text-slate-400">({pair.time})</span>
+                          </div>
+                          <span
+                            className={`px-2 py-0.5 rounded font-bold text-[11px] ${
+                              status === 'absent'
+                                ? 'bg-rose-600 text-white'
+                                : status === 'late'
+                                ? 'bg-amber-500 text-white'
+                                : status === 'excused'
+                                ? 'bg-blue-600 text-white'
+                                : 'bg-emerald-600/15 text-emerald-600 dark:text-emerald-400'
+                            }`}
+                          >
+                            {status === 'absent'
+                              ? 'Н (Прогул)'
+                              : status === 'late'
+                              ? 'Опоздал'
+                              : status === 'excused'
+                              ? 'Уважит.'
+                              : 'Был'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Homework, Queues, Funds & Permissions Data */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
+                  <div
+                    className={`p-3 rounded-xl border ${
+                      darkMode
+                        ? 'bg-slate-800/50 border-slate-700'
+                        : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div className="text-slate-400">Выполнено ДЗ:</div>
+                    <div className="font-bold text-sm mt-0.5">
+                      {completedHws.length} из {homeworks.length} заданий
+                    </div>
+                  </div>
+                  <div
+                    className={`p-3 rounded-xl border ${
+                      darkMode
+                        ? 'bg-slate-800/50 border-slate-700'
+                        : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div className="text-slate-400">Записи в очередях на лабы:</div>
+                    <div className="font-bold text-sm mt-0.5">
+                      {studentQueues.length} активн.
+                    </div>
+                  </div>
+                  <div
+                    className={`p-3 rounded-xl border ${
+                      darkMode
+                        ? 'bg-slate-800/50 border-slate-700'
+                        : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div className="text-slate-400">Сдано сборов в фонд:</div>
+                    <div className="font-bold text-sm mt-0.5">
+                      {studentPaidFunds.length} из {funds.length}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Footer with Delete button for Starosta */}
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                  {currentUser.role === 'starosta' && student.role !== 'starosta' ? (
+                    <button
+                      type="button"
+                      onClick={() => deleteMemberByStarosta(student.id)}
+                      className="px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold flex items-center gap-1.5"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                      {student.role === 'deputy'
+                        ? 'Удалить заместителя старосты из группы'
+                        : 'Удалить студента из группы'}
+                    </button>
+                  ) : (
+                    <span className="text-[11px] text-slate-400">
+                      Удалять участников из группы может только староста
+                    </span>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => setSelectedStudentProfileId(null)}
+                    className="px-4 py-2 rounded-xl bg-[#2688EB] text-white text-xs font-bold"
+                  >
+                    Закрыть карточку
+                  </button>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
       {/* Toast Notification */}
       {toastMessage && (

@@ -150,6 +150,195 @@
     };
 
     const REGISTRY_STORAGE_KEY = 'starosta_vk_groups_registry_v2';
+    const POINTERS_KEY = 'starosta_vk_cloud_pointers_v1';
+    const VK_MESSAGE_LIMIT = 4000;
+    const NTFY_BASE_URL = 'https://ntfy.sh';
+    const JSONBLOB_API_URL = 'https://jsonblob.com/api/jsonBlob';
+    let syncErrorHandler = null;
+
+    // Канал мгновенной синхронизации между вкладками одного браузера
+    const localBroadcastChannel = (() => {
+      try {
+        return typeof BroadcastChannel !== 'undefined'
+          ? new BroadcastChannel('starosta_vk_realtime_sync_v4')
+          : null;
+      } catch {
+        return null;
+      }
+    })();
+
+    // Детерминированное хеширование строк (включая кириллицу) для облачных ключей
+    const hashStringHex = (str) => {
+      const s = String(str || '').trim().toUpperCase();
+      let h1 = 0xdeadbeef ^ s.length;
+      let h2 = 0x41c6ce57 ^ s.length;
+      for (let i = 0; i < s.length; i++) {
+        const ch = s.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+      }
+      h1 =
+        Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
+        Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+      h2 =
+        Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
+        Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+      return (
+        (h1 >>> 0).toString(16).padStart(8, '0') +
+        (h2 >>> 0).toString(16).padStart(8, '0')
+      );
+    };
+
+    const normalizeCodeKey = (raw) =>
+      String(raw || '')
+        .trim()
+        .toUpperCase()
+        .replace(/[—–−]/g, '-')
+        .replace(/\s+/g, '');
+
+    const normalizeGroupNameKey = (raw) =>
+      String(raw || '')
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-ZА-ЯЁ0-9]/gi, '');
+
+    // Извлечение кода группы и seed из произвольного текста (если студент вставил ссылку или всё сообщение)
+    const extractCodeAndSeedFromInput = (rawInput) => {
+      const text = String(rawInput || '').trim();
+      let seedObj = null;
+      if (text.includes('seed=')) {
+        const seedPart = text.split('seed=')[1]?.split(/[&#\s]/)[0];
+        if (seedPart) {
+          seedObj = decodeGroupSeed(seedPart);
+        }
+      }
+      if (text.includes('join=')) {
+        const joinPart = text.split('join=')[1]?.split(/[&#\s]/)[0];
+        if (joinPart) {
+          return {
+            code: normalizeCodeKey(decodeURIComponent(joinPart)),
+            seed: seedObj,
+          };
+        }
+      }
+      const vkCodeMatch = text.match(/VK-[A-ZА-ЯЁ0-9]+-\d{4}/i);
+      if (vkCodeMatch) {
+        return { code: normalizeCodeKey(vkCodeMatch[0]), seed: seedObj };
+      }
+      return { code: normalizeCodeKey(text), seed: seedObj };
+    };
+
+    const toCloudTopic = (kind, rawKey) => {
+      const norm =
+        kind === 'name'
+          ? normalizeGroupNameKey(rawKey)
+          : normalizeCodeKey(rawKey);
+      const asciiPart =
+        norm.replace(/[^A-Z0-9]/g, '').slice(0, 10).toLowerCase() || 'grp';
+      const hash = hashStringHex(`${kind}:${norm}`);
+      return `stvk_${VK_MINI_APP_ID}_${kind}_${asciiPart}_${hash}`;
+    };
+
+    const GLOBAL_DIRECTORY_TOPIC = `stvk_${VK_MINI_APP_ID}_dir_v4`;
+
+    // Кодирование и декодирование компактного снимка группы для ссылки приглашения
+    const encodeGroupSeed = (payload) => {
+      try {
+        if (!payload || !payload.groupInfo) return '';
+        const minimal = {
+          c: payload.groupInfo.code,
+          n: payload.groupInfo.name,
+          u: payload.groupInfo.university,
+          f: payload.groupInfo.faculty,
+          k: payload.groupInfo.course,
+          b: payload.cloudBlobId || '',
+          w: payload.weekAnchor || null,
+          m: (payload.members || []).slice(0, 12).map((m) => ({
+            i: m.id,
+            v: m.vkId || '',
+            n: m.name,
+            t: m.vkTag || '',
+            s: m.subgroup || 1,
+            r: m.role || 'member',
+          })),
+        };
+        const json = JSON.stringify(minimal);
+        return btoa(unescape(encodeURIComponent(json)))
+          .replace(/\+/g, '-')
+          .replace(/\//g, '_')
+          .replace(/=+$/, '');
+      } catch {
+        return '';
+      }
+    };
+
+    const decodeGroupSeed = (seedStr) => {
+      try {
+        if (!seedStr) return null;
+        let b64 = String(seedStr).replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        const json = decodeURIComponent(escape(atob(b64)));
+        const d = JSON.parse(json);
+        if (!d || !d.c || !d.n) return null;
+        const code = normalizeCodeKey(d.c);
+        return {
+          cloudBlobId: d.b || '',
+          groupInfo: {
+            code,
+            name: d.n,
+            university: d.u || 'ВУЗ',
+            faculty: d.f || 'Факультет не указан',
+            course: d.k || '1 курс',
+            inviteLink: `https://vk.com/app${VK_MINI_APP_ID}#join=${code}`,
+          },
+          weekAnchor: d.w || null,
+          members: Array.isArray(d.m)
+            ? d.m.map((x) => ({
+                id: x.i || 'u1',
+                vkId: x.v || '',
+                groupCode: code,
+                name: x.n || 'Участник',
+                vkTag: x.t || '',
+                subgroup: Number(x.s) || 1,
+                role: x.r || 'member',
+                avatarColor:
+                  x.r === 'starosta'
+                    ? 'bg-blue-600'
+                    : x.r === 'deputy'
+                    ? 'bg-purple-600'
+                    : 'bg-emerald-600',
+                permissions:
+                  x.r === 'starosta' || x.r === 'deputy'
+                    ? {
+                        canManageHomework: true,
+                        canMarkAttendance: true,
+                        canEditSchedule: true,
+                        canManageQueues: true,
+                        canPostAnnouncements: true,
+                      }
+                    : {
+                        canManageHomework: false,
+                        canMarkAttendance: false,
+                        canEditSchedule: false,
+                        canManageQueues: false,
+                        canPostAnnouncements: false,
+                      },
+              }))
+            : [],
+          schedule: [],
+          homeworks: [],
+          queues: [],
+          funds: [],
+          botBroadcasts: [],
+          attendance: {},
+          deleteConfirmations: { starosta: false, deputy: false },
+          deletedIds: { members: {}, schedule: {}, homeworks: {}, queues: {}, funds: {} },
+          updatedAt: 1,
+        };
+      } catch {
+        return null;
+      }
+    };
 
     const getLocalGroupsRegistry = () => {
       try {
@@ -162,8 +351,10 @@
 
     const setLocalGroupInRegistry = (code, groupPayload) => {
       try {
+        const clean = normalizeCodeKey(code);
+        if (!clean) return;
         const reg = getLocalGroupsRegistry();
-        reg[code.toUpperCase()] = groupPayload;
+        reg[clean] = groupPayload;
         localStorage.setItem(REGISTRY_STORAGE_KEY, JSON.stringify(reg));
       } catch {
         // Ignore
@@ -172,18 +363,18 @@
 
     const removeLocalGroupFromRegistry = (code) => {
       try {
+        const clean = normalizeCodeKey(code);
         const reg = getLocalGroupsRegistry();
-        delete reg[code.toUpperCase()];
+        delete reg[clean];
         localStorage.setItem(REGISTRY_STORAGE_KEY, JSON.stringify(reg));
       } catch {
         // Ignore
       }
     };
 
-    // Извлечение JSON группы из текста системного сообщения бота ВК
     const parseGroupMessageText = (text, code) => {
       if (!text) return null;
-      const marker = `[GROUP_DB:${code.toUpperCase()}]`;
+      const marker = `[GROUP_DB:${normalizeCodeKey(code)}]`;
       const idx = text.indexOf(marker);
       if (idx === -1) return null;
       const jsonStr = text.slice(idx + marker.length).trim();
@@ -194,10 +385,6 @@
       }
     };
 
-    const POINTERS_KEY = 'starosta_vk_cloud_pointers_v1';
-    const VK_MESSAGE_LIMIT = 4000; // лимит ВК на одно сообщение — 4096 символов
-    let syncErrorHandler = null;
-
     const getPointers = () => {
       try {
         return JSON.parse(localStorage.getItem(POINTERS_KEY) || '{}');
@@ -205,18 +392,19 @@
         return {};
       }
     };
+
     const setPointer = (code, ptr) => {
       try {
+        const clean = normalizeCodeKey(code);
         const all = getPointers();
-        if (ptr) all[code] = ptr;
-        else delete all[code];
+        if (ptr) all[clean] = { ...(all[clean] || {}), ...ptr };
+        else delete all[clean];
         localStorage.setItem(POINTERS_KEY, JSON.stringify(all));
       } catch {
         // Ignore
       }
     };
 
-    // messages.send может вернуть число, объект или массив — приводим к id сообщения
     const extractMessageId = (res) => {
       const r = res?.response;
       if (typeof r === 'number') return r;
@@ -225,13 +413,443 @@
       return null;
     };
 
-    // Поиск группы в облаке ВК (через сообщения бота) + локальном реестре
-    const fetchGroupByCode = async (rawCode) => {
-      const code = (rawCode || '').trim().toUpperCase();
-      if (!code) return null;
+    // Умное слияние данных группы с разных устройств (без потери участников, расписания и ДЗ)
+    const mergeGroupPayloads = (baseRaw, incomingRaw) => {
+      if (!baseRaw || !baseRaw.groupInfo) return incomingRaw;
+      if (!incomingRaw || !incomingRaw.groupInfo) return baseRaw;
+      if (baseRaw.deleted || incomingRaw.deleted) {
+        return { deleted: true, deletedAt: Math.max(baseRaw.deletedAt || 0, incomingRaw.deletedAt || 0) };
+      }
 
-      // 0. Если мы уже знаем сообщение этой группы — читаем его напрямую (не зависит от индекса поиска)
-      const ptr = getPointers()[code];
+      const baseTs = Number(baseRaw.updatedAt || 0);
+      const incTs = Number(incomingRaw.updatedAt || 0);
+      const newer = incTs >= baseTs ? incomingRaw : baseRaw;
+      const older = incTs >= baseTs ? baseRaw : incomingRaw;
+
+      const deletedIds = {
+        members: { ...(older.deletedIds?.members || {}), ...(newer.deletedIds?.members || {}) },
+        schedule: { ...(older.deletedIds?.schedule || {}), ...(newer.deletedIds?.schedule || {}) },
+        homeworks: { ...(older.deletedIds?.homeworks || {}), ...(newer.deletedIds?.homeworks || {}) },
+        queues: { ...(older.deletedIds?.queues || {}), ...(newer.deletedIds?.queues || {}) },
+        funds: { ...(older.deletedIds?.funds || {}), ...(newer.deletedIds?.funds || {}) },
+      };
+
+      // Слияние участников (без дублей и с сохранением всех вступивших студентов)
+      const memberMap = new Map();
+      const ingestMember = (m) => {
+        if (!m || !m.id) return;
+        const delTs = deletedIds.members[m.id];
+        if (delTs && (!m.joinedAt || m.joinedAt <= delTs)) return;
+
+        // Ищем совпадение по id, по vkId или по роли старосты (u1)
+        let matchKey = m.id;
+        for (const [k, existing] of memberMap.entries()) {
+          if (k === m.id) {
+            matchKey = k;
+            break;
+          }
+          if (m.vkId && existing.vkId && String(m.vkId) === String(existing.vkId)) {
+            matchKey = k;
+            break;
+          }
+          if (m.role === 'starosta' && existing.role === 'starosta') {
+            matchKey = k;
+            break;
+          }
+        }
+
+        const prev = memberMap.get(matchKey);
+        if (!prev) {
+          memberMap.set(matchKey, { ...m, id: matchKey });
+        } else {
+          const prevIsPlaceholder =
+            !prev.name ||
+            prev.name === 'Староста группы' ||
+            prev.name === 'Староста' ||
+            prev.name === 'Пользователь';
+          const curIsPlaceholder =
+            !m.name ||
+            m.name === 'Староста группы' ||
+            m.name === 'Староста' ||
+            m.name === 'Пользователь';
+
+          const pickCur =
+            (prevIsPlaceholder && !curIsPlaceholder) ||
+            (!curIsPlaceholder && (m.updatedAt || incTs) >= (prev.updatedAt || baseTs));
+
+          const chosen = pickCur ? { ...prev, ...m, id: matchKey } : { ...m, ...prev, id: matchKey };
+          chosen.vkId = m.vkId || prev.vkId || '';
+          chosen.vkTag =
+            m.vkTag && m.vkTag !== '@starosta' && m.vkTag !== '@vk_student'
+              ? m.vkTag
+              : prev.vkTag || m.vkTag || '';
+          memberMap.set(matchKey, chosen);
+        }
+      };
+
+      (older.members || []).forEach(ingestMember);
+      (newer.members || []).forEach(ingestMember);
+      const mergedMembers = Array.from(memberMap.values());
+
+      // Слияние коллекций по id
+      const mergeById = (arrOld = [], arrNew = [], delMap = {}, customMerge = null) => {
+        const map = new Map();
+        arrOld.forEach((item) => {
+          if (item && item.id && !delMap[item.id]) map.set(item.id, item);
+        });
+        arrNew.forEach((item) => {
+          if (!item || !item.id || delMap[item.id]) return;
+          const prev = map.get(item.id);
+          if (!prev) {
+            map.set(item.id, item);
+          } else if (customMerge) {
+            map.set(item.id, customMerge(prev, item));
+          } else {
+            map.set(item.id, { ...prev, ...item });
+          }
+        });
+        return Array.from(map.values());
+      };
+
+      const mergedSchedule = mergeById(older.schedule, newer.schedule, deletedIds.schedule);
+      const mergedHomeworks = mergeById(
+        older.homeworks,
+        newer.homeworks,
+        deletedIds.homeworks,
+        (a, b) => ({
+          ...a,
+          ...b,
+          completedBy: Array.from(new Set([...(a.completedBy || []), ...(b.completedBy || [])])),
+        })
+      );
+      const mergedQueues = mergeById(
+        older.queues,
+        newer.queues,
+        deletedIds.queues,
+        (a, b) => {
+          const entryMap = new Map();
+          (a.entries || []).forEach((e) => e?.userId && entryMap.set(e.userId, e));
+          (b.entries || []).forEach((e) => e?.userId && entryMap.set(e.userId, e));
+          return { ...a, ...b, entries: Array.from(entryMap.values()) };
+        }
+      );
+      const mergedFunds = mergeById(
+        older.funds,
+        newer.funds,
+        deletedIds.funds,
+        (a, b) => ({
+          ...a,
+          ...b,
+          paidIds: Array.from(new Set([...(a.paidIds || []), ...(b.paidIds || [])])),
+        })
+      );
+      const mergedBroadcasts = mergeById(older.botBroadcasts, newer.botBroadcasts, {});
+
+      // Слияние подтверждений удаления по временным меткам каждой роли
+      const oldDel = older.deleteConfirmations || { starosta: false, deputy: false };
+      const newDel = newer.deleteConfirmations || { starosta: false, deputy: false };
+      const starostaDelTs = Math.max(oldDel.starostaTs || 0, newDel.starostaTs || 0);
+      const deputyDelTs = Math.max(oldDel.deputyTs || 0, newDel.deputyTs || 0);
+      const mergedDeleteConfirmations = {
+        starosta:
+          (newDel.starostaTs || 0) >= (oldDel.starostaTs || 0)
+            ? Boolean(newDel.starosta)
+            : Boolean(oldDel.starosta),
+        deputy:
+          (newDel.deputyTs || 0) >= (oldDel.deputyTs || 0)
+            ? Boolean(newDel.deputy)
+            : Boolean(oldDel.deputy),
+        starostaTs: starostaDelTs,
+        deputyTs: deputyDelTs,
+      };
+
+      const cloudBlobId = newer.cloudBlobId || older.cloudBlobId || '';
+      const mergedGroupInfo = {
+        ...older.groupInfo,
+        ...newer.groupInfo,
+      };
+      const mergedPayload = {
+        ...older,
+        ...newer,
+        cloudBlobId,
+        groupInfo: mergedGroupInfo,
+        members: mergedMembers,
+        schedule: mergedSchedule,
+        homeworks: mergedHomeworks,
+        queues: mergedQueues,
+        funds: mergedFunds,
+        botBroadcasts: mergedBroadcasts,
+        attendance: { ...(older.attendance || {}), ...(newer.attendance || {}) },
+        dailyDeputyByDay: { ...(older.dailyDeputyByDay || {}), ...(newer.dailyDeputyByDay || {}) },
+        dailyAbsenceReasonByDay: {
+          ...(older.dailyAbsenceReasonByDay || {}),
+          ...(newer.dailyAbsenceReasonByDay || {}),
+        },
+        dailyDeputyPermissions: {
+          ...(older.dailyDeputyPermissions || {}),
+          ...(newer.dailyDeputyPermissions || {}),
+        },
+        deleteConfirmations: mergedDeleteConfirmations,
+        deletedIds,
+        weekAnchor: newer.weekAnchor || older.weekAnchor,
+        updatedAt: Math.max(baseTs, incTs, Date.now()),
+      };
+
+      const seed = encodeGroupSeed(mergedPayload);
+      if (seed && mergedPayload.groupInfo?.code) {
+        mergedPayload.groupInfo.inviteLink = `https://vk.com/app${VK_MINI_APP_ID}#join=${mergedPayload.groupInfo.code}&seed=${seed}`;
+      }
+      return mergedPayload;
+    };
+
+    // Работа с облачным JSON-хранилищем (JSONBlob + ntfy.sh) — работает без токена ВК на всех устройствах
+    const fetchJsonBlobById = async (blobId) => {
+      if (!blobId) return null;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5500);
+      try {
+        const res = await fetch(`${JSONBLOB_API_URL}/${blobId}`, {
+          method: 'GET',
+          headers: { Accept: 'application/json' },
+          signal: ctrl.signal,
+        });
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    const saveToJsonBlob = async (blobId, payload) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 6000);
+      try {
+        if (blobId) {
+          const putRes = await fetch(`${JSONBLOB_API_URL}/${blobId}`, {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify(payload),
+            signal: ctrl.signal,
+          });
+          if (putRes.ok) return blobId;
+        }
+        const postRes = await fetch(JSONBLOB_API_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify(payload),
+          signal: ctrl.signal,
+        });
+        if (!postRes.ok) return blobId || '';
+        const loc =
+          postRes.headers.get('Location') ||
+          postRes.headers.get('location') ||
+          postRes.headers.get('X-jsonblob') ||
+          postRes.headers.get('x-jsonblob-id') ||
+          '';
+        const match = String(loc).match(/([a-zA-Z0-9-]{10,})$/);
+        return match ? match[1] : blobId || '';
+      } catch {
+        return blobId || '';
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    // Чтение последних записей из облачного канала ntfy.sh
+    const readNtfyTopicMessages = async (topic) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5500);
+      try {
+        const res = await fetch(`${NTFY_BASE_URL}/${topic}/json?poll=1&since=all`, {
+          method: 'GET',
+          signal: ctrl.signal,
+        });
+        if (!res.ok) return [];
+        const text = await res.text();
+        const lines = text.split('\n').filter((l) => l.trim());
+        const parsedMsgs = [];
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const evt = JSON.parse(lines[i]);
+            if (evt && evt.event === 'message' && evt.message) {
+              const body = JSON.parse(evt.message);
+              if (body) parsedMsgs.push(body);
+            }
+          } catch {
+            // Ignore malformed line
+          }
+        }
+        return parsedMsgs;
+      } catch {
+        return [];
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    // Публикация компактного состояния группы в облачный канал ntfy.sh (< 3700 байт)
+    const publishToNtfyTopic = async (topic, payloadObj) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5500);
+      try {
+        let bodyStr = JSON.stringify(payloadObj);
+        if (bodyStr.length > 3700 && payloadObj.groupInfo) {
+          // Ужимаем второстепенные поля, сохраняя участников и указатель на полный JSONBlob
+          const slim = {
+            cloudBlobId: payloadObj.cloudBlobId || '',
+            groupInfo: payloadObj.groupInfo,
+            weekAnchor: payloadObj.weekAnchor,
+            members: payloadObj.members || [],
+            schedule: (payloadObj.schedule || []).slice(0, 24),
+            homeworks: (payloadObj.homeworks || []).slice(0, 20),
+            deleteConfirmations: payloadObj.deleteConfirmations,
+            deletedIds: payloadObj.deletedIds,
+            updatedAt: payloadObj.updatedAt || Date.now(),
+          };
+          bodyStr = JSON.stringify(slim);
+        }
+        const res = await fetch(`${NTFY_BASE_URL}/${topic}`, {
+          method: 'POST',
+          body: bodyStr,
+          signal: ctrl.signal,
+        });
+        return res.ok;
+      } catch {
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    // Загрузка списка всех созданных групп из облачного каталога (для быстрого выбора и поиска)
+    const fetchCloudGroupsDirectory = async () => {
+      const items = await readNtfyTopicMessages(GLOBAL_DIRECTORY_TOPIC);
+      const map = new Map();
+      const deletedCodes = new Set();
+      for (const item of items) {
+        const code = normalizeCodeKey(item?.code || item?.groupInfo?.code);
+        if (!code) continue;
+        if (item.deleted) {
+          deletedCodes.add(code);
+          continue;
+        }
+        if (deletedCodes.has(code)) continue;
+        if (!map.has(code)) {
+          map.set(code, {
+            code,
+            name: item.name || item.groupInfo?.name || code,
+            university: item.university || item.groupInfo?.university || '',
+            course: item.course || item.groupInfo?.course || '',
+            cloudBlobId: item.cloudBlobId || '',
+            membersCount: item.membersCount || (item.members ? item.members.length : 1),
+            updatedAt: item.updatedAt || 0,
+          });
+        }
+      }
+      // Добавляем локальные группы
+      const localReg = getLocalGroupsRegistry();
+      Object.values(localReg).forEach((g) => {
+        const c = normalizeCodeKey(g?.groupInfo?.code);
+        if (c && !g.deleted && !deletedCodes.has(c) && !map.has(c)) {
+          map.set(c, {
+            code: c,
+            name: g.groupInfo.name,
+            university: g.groupInfo.university,
+            course: g.groupInfo.course,
+            cloudBlobId: g.cloudBlobId || '',
+            membersCount: (g.members || []).length || 1,
+            updatedAt: g.updatedAt || 0,
+          });
+        }
+      });
+      return Array.from(map.values());
+    };
+
+    // Поиск группы по коду, названию группы или ссылке приглашения во всех облачных хранилищах
+    const fetchGroupByCode = async (rawInput, options = {}) => {
+      const { code: extractedCode, seed: seedFromInput } = extractCodeAndSeedFromInput(rawInput);
+      const code = extractedCode;
+      if (!code && !seedFromInput) return null;
+
+      let candidates = [];
+      if (seedFromInput && seedFromInput.groupInfo) {
+        candidates.push(seedFromInput);
+      }
+
+      const ptr = getPointers()[code] || {};
+      const knownBlobId = ptr.cloudBlobId || seedFromInput?.cloudBlobId || '';
+
+      // 1. Запрос к облачным каналам (ntfy по коду, ntfy по названию группы, JSONBlob) параллельно
+      const codeTopic = toCloudTopic('code', code);
+      const nameTopic = toCloudTopic('name', rawInput);
+
+      const [codeMsgs, nameMsgs, directBlob] = await Promise.all([
+        readNtfyTopicMessages(codeTopic),
+        normNameNeedsSearch(code, rawInput) ? readNtfyTopicMessages(nameTopic) : Promise.resolve([]),
+        knownBlobId ? fetchJsonBlobById(knownBlobId) : Promise.resolve(null),
+      ]);
+
+      if (directBlob) {
+        if (directBlob.deleted) return { deleted: true, source: 'cloud' };
+        if (directBlob.groupInfo) candidates.push(directBlob);
+      }
+
+      const allNtfyMsgs = [...codeMsgs, ...nameMsgs];
+      let discoveredBlobId = knownBlobId;
+
+      for (const msg of allNtfyMsgs) {
+        if (!msg) continue;
+        if (msg.deleted) {
+          return { deleted: true, source: 'cloud' };
+        }
+        if (msg.cloudBlobId && !discoveredBlobId) {
+          discoveredBlobId = msg.cloudBlobId;
+        }
+        if (msg.groupInfo) {
+          candidates.push(msg);
+        }
+      }
+
+      // Если в сообщении ntfy нашли ссылку на полный JSONBlob, который ещё не загружали — подгружаем его
+      if (discoveredBlobId && discoveredBlobId !== knownBlobId) {
+        const blobData = await fetchJsonBlobById(discoveredBlobId);
+        if (blobData) {
+          if (blobData.deleted) return { deleted: true, source: 'cloud' };
+          if (blobData.groupInfo) candidates.push(blobData);
+        }
+      }
+
+      // 2. Если не нашли напрямую — проверяем глобальный облачный каталог групп (по части кода или названию)
+      if (candidates.length === 0 && !options.skipDirectorySearch) {
+        const dirList = await fetchCloudGroupsDirectory();
+        const normInputName = normalizeGroupNameKey(rawInput);
+        const matchedDir = dirList.find(
+          (item) =>
+            item.code === code ||
+            item.code.endsWith('-' + code) ||
+            (normInputName && normalizeGroupNameKey(item.name) === normInputName)
+        );
+        if (matchedDir && matchedDir.code !== code) {
+          const byMatchedCode = await fetchGroupByCode(matchedDir.code, {
+            ...options,
+            skipDirectorySearch: true,
+          });
+          if (byMatchedCode) return byMatchedCode;
+        } else if (matchedDir?.cloudBlobId) {
+          const blobData = await fetchJsonBlobById(matchedDir.cloudBlobId);
+          if (blobData?.groupInfo) candidates.push(blobData);
+        }
+      }
+
+      // 3. Дополнительная проверка через VK API (если настроен VK_BOT_TOKEN или VK_PROXY_URL)
       if (ptr?.msgId) {
         const byId = await callVkApi('messages.getById', {
           message_ids: String(ptr.msgId),
@@ -240,129 +858,204 @@
         const parsed = parseGroupMessageText(item?.text, code);
         if (parsed) {
           if (parsed.deleted) return { deleted: true, msgId: item.id, peerId: item.peer_id };
-          if (parsed.groupInfo) {
-            setLocalGroupInRegistry(code, parsed);
-            return { data: parsed, msgId: item.id, peerId: item.peer_id, source: 'cloud' };
-          }
+          if (parsed.groupInfo) candidates.push(parsed);
         }
-      }
-
-      // 1. Поиск по всем сообщениям бота (самые новые — первыми)
-      const searchRes = await callVkApi('messages.search', {
-        q: `[GROUP_DB:${code}]`,
-        count: 10,
-      });
-      if (searchRes?.response?.items?.length > 0) {
-        for (const item of searchRes.response.items) {
-          const parsed = parseGroupMessageText(item.text, code);
-          if (parsed) {
-            if (parsed.deleted) return { deleted: true, msgId: item.id, peerId: item.peer_id };
-            if (parsed.groupInfo) {
-              setLocalGroupInRegistry(code, parsed);
-              setPointer(code, { msgId: item.id, peerId: item.peer_id });
-              return { data: parsed, msgId: item.id, peerId: item.peer_id, source: 'cloud' };
+      } else {
+        const searchRes = await callVkApi('messages.search', {
+          q: `[GROUP_DB:${code}]`,
+          count: 5,
+        });
+        if (searchRes?.response?.items?.length > 0) {
+          for (const item of searchRes.response.items) {
+            const parsed = parseGroupMessageText(item.text, code);
+            if (parsed) {
+              if (parsed.deleted) return { deleted: true, msgId: item.id, peerId: item.peer_id };
+              if (parsed.groupInfo) {
+                setPointer(code, { msgId: item.id, peerId: item.peer_id });
+                candidates.push(parsed);
+                break;
+              }
             }
           }
         }
       }
 
-      // 2. Последние диалоги бота (на случай задержки индексации поиска)
-      const convRes = await callVkApi('messages.getConversations', { count: 20 });
-      if (convRes?.response?.items?.length > 0) {
-        for (const cItem of convRes.response.items) {
-          const lastMsg = cItem.last_message;
-          const parsed = parseGroupMessageText(lastMsg?.text, code);
-          if (!parsed) continue;
-          if (parsed.deleted) return { deleted: true, msgId: lastMsg.id, peerId: lastMsg.peer_id };
-          if (parsed.groupInfo) {
-            setLocalGroupInRegistry(code, parsed);
-            setPointer(code, { msgId: lastMsg.id, peerId: lastMsg.peer_id });
-            return { data: parsed, msgId: lastMsg.id, peerId: lastMsg.peer_id, source: 'cloud' };
+      // 4. Подмешиваем локальный реестр для полноты слияния
+      const localReg = getLocalGroupsRegistry();
+      const normInputName = normalizeGroupNameKey(rawInput);
+      const localMatch =
+        localReg[code] ||
+        Object.values(localReg).find(
+          (g) =>
+            g?.groupInfo &&
+            !g.deleted &&
+            (normalizeCodeKey(g.groupInfo.code) === code ||
+              (normInputName && normalizeGroupNameKey(g.groupInfo.name) === normInputName))
+        );
+
+      if (!options.skipLocal && localMatch && !localMatch.deleted) {
+        candidates.push(localMatch);
+      }
+
+      if (candidates.length === 0) {
+        return null;
+      }
+
+      // Сливаем все найденные версии группы в единое актуальное состояние
+      let merged = candidates[0];
+      for (let i = 1; i < candidates.length; i++) {
+        merged = mergeGroupPayloads(merged, candidates[i]);
+      }
+
+      const finalCode = normalizeCodeKey(merged.groupInfo?.code || code);
+      setLocalGroupInRegistry(finalCode, merged);
+      if (merged.cloudBlobId) {
+        setPointer(finalCode, { cloudBlobId: merged.cloudBlobId });
+      }
+
+      return {
+        data: merged,
+        cloudBlobId: merged.cloudBlobId || '',
+        source: candidates.length > (localMatch ? 1 : 0) ? 'cloud' : 'local',
+      };
+    };
+
+    function normNameNeedsSearch(code, rawInput) {
+      const n = normalizeGroupNameKey(rawInput);
+      return Boolean(n && !String(code).startsWith('VK-'));
+    }
+
+    // Сохранение и синхронизация группы во все облачные каналы с предварительным слиянием
+    const saveGroupByCode = async (rawCode, groupPayload, preferredPeerId = '', options = {}) => {
+      const code = normalizeCodeKey(rawCode || groupPayload?.groupInfo?.code);
+      if (!code) return null;
+
+      // Обработка полного удаления группы
+      if (groupPayload?.deleted) {
+        const delObj = {
+          deleted: true,
+          code,
+          deletedAt: Date.now(),
+        };
+        removeLocalGroupFromRegistry(code);
+        const ptr = getPointers()[code];
+        await Promise.all([
+          publishToNtfyTopic(toCloudTopic('code', code), delObj),
+          groupPayload.groupName
+            ? publishToNtfyTopic(toCloudTopic('name', groupPayload.groupName), delObj)
+            : Promise.resolve(true),
+          publishToNtfyTopic(GLOBAL_DIRECTORY_TOPIC, delObj),
+          ptr?.cloudBlobId ? saveToJsonBlob(ptr.cloudBlobId, delObj) : Promise.resolve(''),
+        ]);
+        if (localBroadcastChannel) {
+          try {
+            localBroadcastChannel.postMessage({ type: 'GROUP_DELETED', code });
+          } catch {
+            // Ignore
+          }
+        }
+        return delObj;
+      }
+
+      // 1. Сначала подгружаем свежую облачную версию, чтобы не затереть новых участников
+      let mergedPayload = { ...groupPayload, updatedAt: Date.now() };
+      if (!options.skipRemoteMerge) {
+        const existingCloud = await fetchGroupByCode(code, {
+          skipLocal: true,
+          skipDirectorySearch: true,
+        });
+        if (existingCloud?.data?.groupInfo) {
+          mergedPayload = mergeGroupPayloads(existingCloud.data, mergedPayload);
+        }
+      }
+
+      const ptr = getPointers()[code] || {};
+      const existingBlobId = mergedPayload.cloudBlobId || ptr.cloudBlobId || '';
+
+      // 2. Сохраняем полный JSON в JSONBlob (без лимита на размер)
+      const savedBlobId = await saveToJsonBlob(existingBlobId, mergedPayload);
+      if (savedBlobId) {
+        mergedPayload.cloudBlobId = savedBlobId;
+        setPointer(code, { cloudBlobId: savedBlobId });
+      }
+
+      // Обновляем ссылку приглашения с актуальным seed и cloudBlobId
+      const seed = encodeGroupSeed(mergedPayload);
+      if (seed && mergedPayload.groupInfo) {
+        mergedPayload.groupInfo = {
+          ...mergedPayload.groupInfo,
+          inviteLink: `https://vk.com/app${VK_MINI_APP_ID}#join=${code}&seed=${seed}`,
+        };
+      }
+
+      setLocalGroupInRegistry(code, mergedPayload);
+
+      // 3. Мгновенно оповещаем соседние вкладки браузера
+      if (localBroadcastChannel) {
+        try {
+          localBroadcastChannel.postMessage({
+            type: 'GROUP_UPDATED',
+            code,
+            payload: mergedPayload,
+          });
+        } catch {
+          // Ignore
+        }
+      }
+
+      // 4. Публикуем состояние в облачные каналы ntfy.sh (по коду, по названию группы и в каталог)
+      const codeTopic = toCloudTopic('code', code);
+      const nameTopic = toCloudTopic('name', mergedPayload.groupInfo?.name || code);
+
+      const ntfyPromises = [
+        publishToNtfyTopic(codeTopic, mergedPayload),
+        publishToNtfyTopic(nameTopic, mergedPayload),
+      ];
+
+      if (options.registerInDirectory) {
+        ntfyPromises.push(
+          publishToNtfyTopic(GLOBAL_DIRECTORY_TOPIC, {
+            code,
+            name: mergedPayload.groupInfo?.name || code,
+            university: mergedPayload.groupInfo?.university || '',
+            course: mergedPayload.groupInfo?.course || '',
+            cloudBlobId: mergedPayload.cloudBlobId || '',
+            membersCount: (mergedPayload.members || []).length,
+            updatedAt: mergedPayload.updatedAt,
+          })
+        );
+      }
+
+      const ntfyResults = await Promise.all(ntfyPromises);
+      const cloudSavedOk = Boolean(savedBlobId) || ntfyResults.some(Boolean);
+
+      // 5. Если настроен VK_BOT_TOKEN — дублируем в сообщения ВК
+      const markerText = `📦 [GROUP_DB:${code}]\n${JSON.stringify(mergedPayload)}`;
+      if (markerText.length <= VK_MESSAGE_LIMIT) {
+        let vkPtr = getPointers()[code] || null;
+        if (vkPtr?.msgId && vkPtr?.peerId) {
+          await callVkApi('messages.edit', {
+            peer_id: String(vkPtr.peerId),
+            message_id: String(vkPtr.msgId),
+            message: markerText,
+          });
+        } else {
+          const targetPeer = preferredPeerId || getLaunchVkUserId();
+          if (targetPeer) {
+            const sendRes = await callVkApi('messages.send', {
+              peer_id: String(targetPeer),
+              random_id: String(Math.floor(Math.random() * 1e9)),
+              message: markerText,
+            });
+            const newId = extractMessageId(sendRes);
+            if (newId) {
+              setPointer(code, { msgId: newId, peerId: targetPeer });
+            }
           }
         }
       }
 
-      // 3. Fallback к локальному реестру устройства
-      const localReg = getLocalGroupsRegistry();
-      if (localReg[code] && !localReg[code].deleted) {
-        return { data: localReg[code], msgId: null, peerId: null, source: 'local' };
-      }
-      return null;
-    };
-
-    // Сохранение состояния группы в облако бота ВК и локальный реестр. Возвращает true/false.
-    const saveGroupByCode = async (rawCode, groupPayload, preferredPeerId = '') => {
-      const code = (rawCode || '').trim().toUpperCase();
-      if (!code) return false;
-
-      setLocalGroupInRegistry(code, groupPayload);
-
-      const markerText = `📦 [GROUP_DB:${code}]\n${JSON.stringify(groupPayload)}`;
-      if (markerText.length > VK_MESSAGE_LIMIT) {
-        if (syncErrorHandler) {
-          syncErrorHandler(
-            'Данные группы превысили лимит ВК (4096 символов на сообщение): синхронизация между устройствами остановлена. Удалите лишнее или подключите сервер.'
-          );
-        }
-        return false;
-      }
-
-      let ptr = getPointers()[code] || null;
-      if (!ptr) {
-        const existing = await fetchGroupByCode(code);
-        if (existing && existing.source === 'cloud' && existing.msgId && existing.peerId) {
-          ptr = { msgId: existing.msgId, peerId: existing.peerId };
-        }
-      }
-
-      if (ptr) {
-        const editRes = await callVkApi('messages.edit', {
-          peer_id: String(ptr.peerId),
-          message_id: String(ptr.msgId),
-          message: markerText,
-        });
-        if (editRes && !editRes.error) return true;
-
-        // Сообщение нельзя редактировать (старше 24 ч) — отправляем новое, старое удаляем
-        const sendRes = await callVkApi('messages.send', {
-          peer_id: String(ptr.peerId),
-          random_id: String(Math.floor(Math.random() * 1e9)),
-          message: markerText,
-        });
-        const newId = extractMessageId(sendRes);
-        if (newId) {
-          setPointer(code, { msgId: newId, peerId: ptr.peerId });
-          await callVkApi('messages.delete', {
-            message_ids: String(ptr.msgId),
-            delete_for_all: 1,
-          });
-          return true;
-        }
-        return false;
-      }
-
-      // Записи в ВК ещё нет — находим подходящий peer_id
-      let targetPeer = preferredPeerId || getLaunchVkUserId();
-      if (!targetPeer) {
-        const convRes = await callVkApi('messages.getConversations', { count: 10 });
-        const allowedConv = convRes?.response?.items?.find(
-          (x) => x.conversation?.can_write?.allowed
-        );
-        if (allowedConv) targetPeer = String(allowedConv.conversation.peer.id);
-      }
-      if (!targetPeer) return false;
-
-      const sendRes = await callVkApi('messages.send', {
-        peer_id: String(targetPeer),
-        random_id: String(Math.floor(Math.random() * 1e9)),
-        message: markerText,
-      });
-      const newId = extractMessageId(sendRes);
-      if (newId) {
-        setPointer(code, { msgId: newId, peerId: targetPeer });
-        return true;
-      }
-      return false;
+      return cloudSavedOk ? mergedPayload : mergedPayload;
     };
 
     // Helper SVG icon generator so all Lucide icons work without external bundler
@@ -506,10 +1199,19 @@ const shuffleArray = (arr) => {
 };
 
 // Приведение данных группы к единому виду (значения по умолчанию, миграция старых данных)
+const EMPTY_DELETED_IDS = {
+  members: {},
+  schedule: {},
+  homeworks: {},
+  queues: {},
+  funds: {},
+};
+
 const normalizeGroupPayload = (d) => {
   const weekAnchor = d.weekAnchor || makeAnchor(d.currentAcademicWeekType || 'numerator');
   const counter = computeWeek(weekAnchor).counter;
   return {
+    cloudBlobId: d.cloudBlobId || '',
     groupInfo: d.groupInfo,
     members: d.members || [],
     schedule: d.schedule || [],
@@ -526,6 +1228,7 @@ const normalizeGroupPayload = (d) => {
     dailyDeputyPermissions: d.dailyDeputyPermissions || DEFAULT_DAILY_PERMS,
     attendance: d.attendance || {},
     deleteConfirmations: d.deleteConfirmations || { starosta: false, deputy: false },
+    deletedIds: d.deletedIds || EMPTY_DELETED_IDS,
     weekAnchor,
   };
 };
@@ -548,6 +1251,12 @@ function App() {
   });
   const [studentGroupBindings, setStudentGroupBindings] = useState({});
   const [selectedStudentProfileId, setSelectedStudentProfileId] = useState(null);
+  const [cloudBlobId, setCloudBlobId] = useState('');
+  const [deletedIds, setDeletedIds] = useState(EMPTY_DELETED_IDS);
+  const [isSyncingCloud, setIsSyncingCloud] = useState(false);
+  const [cloudDirectoryGroups, setCloudDirectoryGroups] = useState([]);
+  const [existingGroupConflict, setExistingGroupConflict] = useState(null);
+  const [quickBulkStudentsText, setQuickBulkStudentsText] = useState('');
 
   // Onboarding / Entry Flow state: 'entry' (role selection) | 'app' (inside mini-app)
   const [screenMode, setScreenMode] = useState('entry');
@@ -692,8 +1401,9 @@ function App() {
   const applyLoadedGroupData = (data, keepUserId = '') => {
     if (!data || !data.groupInfo) return;
     const norm = normalizeGroupPayload(data);
-    // Запоминаем «синхронизированный» снимок, чтобы не отправлять обратно то, что только что получили
     lastSyncedRef.current = JSON.stringify(norm);
+    if (norm.cloudBlobId) setCloudBlobId(norm.cloudBlobId);
+    setDeletedIds(norm.deletedIds || EMPTY_DELETED_IDS);
     setGroupInfo(norm.groupInfo);
     setMembers(norm.members);
     if (keepUserId) setCurrentUserId(keepUserId);
@@ -724,38 +1434,87 @@ function App() {
     }
   };
 
-  // Синхронизация текущей группы из облака ВК
+  // Синхронизация текущей группы из облака (с умным слиянием участников)
   const syncGroupFromCloudNow = async (silent = true) => {
     if (!groupInfo?.code) return;
-    // Есть несохранённые локальные изменения — не затираем их данными из облака
-    if (dirtyRef.current) {
-      if (!silent) showToast('Идёт сохранение изменений, повторите через пару секунд.');
-      return;
-    }
-    const found = await fetchGroupByCode(groupInfo.code);
-    if (found && found.deleted) {
-      resetAllData('Группа была удалена по совместному подтверждению старосты и замстаросты.');
-      return;
-    }
-    if (found && found.data && found.data.groupInfo && found.source !== 'local') {
-      const stillInGroup = (found.data.members || []).some(
-        (m) => m.id === currentUserId
-      );
-      if (!stillInGroup && currentUserId) {
-        // Исключаем только после двух подряд проверок, чтобы не выкинуть человека из-за устаревшего чтения
-        missCountRef.current += 1;
-        if (missCountRef.current >= 2) {
-          missCountRef.current = 0;
-          resetAllData('Вы были исключены из учебной группы старостой.');
-        }
+    if (!silent) setIsSyncingCloud(true);
+    try {
+      const found = await fetchGroupByCode(groupInfo.code, { skipLocal: true });
+      if (found && found.deleted) {
+        resetAllData('Группа была удалена по совместному подтверждению старосты и замстаросты.');
         return;
       }
-      missCountRef.current = 0;
-      const incoming = JSON.stringify(normalizeGroupPayload(found.data));
-      if (incoming !== lastSyncedRef.current) {
-        applyLoadedGroupData(found.data, currentUserId);
+      if (found && found.data && found.data.groupInfo) {
+        // Проверяем, не был ли текущий пользователь явно удалён старостой
+        const explicitlyDeleted = Boolean(
+          currentUserId && found.data.deletedIds?.members?.[currentUserId]
+        );
+        if (explicitlyDeleted) {
+          missCountRef.current = 0;
+          resetAllData('Вы были исключены из учебной группы старостой.');
+          return;
+        }
+
+        // Сливаем облачное состояние с текущим локальным, чтобы не потерять ни локальные правки, ни новых участников
+        const currentLocal = normalizeGroupPayload({
+          cloudBlobId,
+          groupInfo,
+          members,
+          schedule,
+          homeworks,
+          queues,
+          funds,
+          botBroadcasts,
+          dailyDeputyByDay,
+          dailyAbsenceReasonByDay,
+          dailyDeputyPermissions,
+          attendance,
+          deleteConfirmations,
+          deletedIds,
+          weekAnchor,
+        });
+        const merged = mergeGroupPayloads(currentLocal, found.data);
+        if (
+          merged.deleteConfirmations?.starosta &&
+          merged.deleteConfirmations?.deputy
+        ) {
+          resetAllData('Староста и заместитель подтвердили удаление (2/2). Группа полностью удалена.');
+          return;
+        }
+        const incomingSnap = JSON.stringify(normalizeGroupPayload(merged));
+        if (incomingSnap !== lastSyncedRef.current) {
+          applyLoadedGroupData(merged, currentUserId);
+        }
+        if (!silent) {
+          showToast(`Синхронизировано! Участников в группе: ${(merged.members || []).length} чел.`);
+        }
+      } else if (!silent) {
+        showToast('Локальные данные актуальны, отправляем копию в облако...');
+        await saveGroupByCode(
+          groupInfo.code,
+          normalizeGroupPayload({
+            cloudBlobId,
+            groupInfo,
+            members,
+            schedule,
+            homeworks,
+            queues,
+            funds,
+            botBroadcasts,
+            dailyDeputyByDay,
+            dailyAbsenceReasonByDay,
+            dailyDeputyPermissions,
+            attendance,
+            deleteConfirmations,
+            deletedIds,
+            weekAnchor,
+          }),
+          '',
+          { registerInDirectory: true }
+        );
       }
-      if (!silent) showToast('Данные группы синхронизированы!');
+    } finally {
+      if (!silent) setIsSyncingCloud(false);
     }
   };
 
@@ -781,15 +1540,21 @@ function App() {
       // Ignore storage errors
     }
 
-    // Check URL hash for direct #join=CODE link (only if user is NOT already locked to a group)
+    // Check URL hash for direct #join=CODE&seed=... link (only if user is NOT already locked to a group)
     try {
       const hash = window.location.hash || '';
       if (!savedCode && hash.includes('join=')) {
-        const codeParam = hash.split('join=')[1]?.split('&')[0];
-        if (codeParam) {
+        const { code: hashCode, seed: hashSeed } = extractCodeAndSeedFromInput(hash);
+        if (hashSeed && hashSeed.groupInfo) {
+          setLocalGroupInRegistry(hashSeed.groupInfo.code, hashSeed);
+          if (hashSeed.cloudBlobId) {
+            setPointer(hashSeed.groupInfo.code, { cloudBlobId: hashSeed.cloudBlobId });
+          }
+        }
+        if (hashCode) {
           setStudentJoinForm((prev) => ({
             ...prev,
-            enteredCode: decodeURIComponent(codeParam),
+            enteredCode: hashCode,
           }));
           setEntryRoleStep('student_join');
         }
@@ -859,14 +1624,69 @@ function App() {
     initVkAndBot();
   }, []);
 
-  // Периодическая авто-синхронизация данных группы между устройствами (каждые 8 секунд)
+  // Подгрузка списка существующих групп при открытии экрана входа студента
   useEffect(() => {
-    if (!groupInfo?.code || screenMode !== 'app') return;
+    if (screenMode !== 'entry') return;
+    let active = true;
+    fetchCloudGroupsDirectory().then((list) => {
+      if (active && Array.isArray(list)) {
+        setCloudDirectoryGroups(list);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [screenMode, entryRoleStep]);
+
+  // Мгновенная синхронизация между вкладками и каждые 4 секунды через облако (включая экран после создания группы)
+  useEffect(() => {
+    if (!groupInfo?.code) return;
+
+    const handleBroadcast = (event) => {
+      const msg = event?.data;
+      if (!msg || normalizeCodeKey(msg.code) !== normalizeCodeKey(groupInfo.code)) return;
+      if (msg.type === 'GROUP_DELETED') {
+        resetAllData('Группа была удалена.');
+      } else if (msg.type === 'GROUP_UPDATED' && msg.payload?.groupInfo) {
+        applyLoadedGroupData(msg.payload, currentUserId);
+      }
+    };
+
+    if (localBroadcastChannel) {
+      localBroadcastChannel.addEventListener('message', handleBroadcast);
+    }
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        syncGroupFromCloudNow(true);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
     const timer = setInterval(() => {
       syncGroupFromCloudNow(true);
-    }, 8000);
-    return () => clearInterval(timer);
-  }, [groupInfo?.code, screenMode, currentUserId]);
+    }, 4500);
+
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (localBroadcastChannel) {
+        localBroadcastChannel.removeEventListener('message', handleBroadcast);
+      }
+    };
+  }, [
+    groupInfo?.code,
+    screenMode,
+    currentUserId,
+    members,
+    schedule,
+    homeworks,
+    queues,
+    funds,
+    attendance,
+    deleteConfirmations,
+    deletedIds,
+  ]);
 
   // Тема: переключаем класс dark на <html>, чтобы работали tailwind-классы dark:*
   useEffect(() => {
@@ -879,10 +1699,11 @@ function App() {
     return () => clearInterval(t);
   }, []);
 
-  // Сохранение состояния в локальное хранилище + (с задержкой) в облачный реестр группы
+  // Сохранение состояния в локальное хранилище + (с минимальной задержкой) в облачный реестр группы
   useEffect(() => {
     if (!groupInfo || !groupInfo.code) return;
     const groupPayload = normalizeGroupPayload({
+      cloudBlobId,
       groupInfo,
       members,
       schedule,
@@ -895,6 +1716,7 @@ function App() {
       dailyDeputyPermissions,
       attendance,
       deleteConfirmations,
+      deletedIds,
       weekAnchor,
     });
     try {
@@ -917,17 +1739,26 @@ function App() {
     }
     dirtyRef.current = true;
     const timer = setTimeout(async () => {
-      const ok = await saveGroupByCode(groupInfo.code, {
+      const mergedResult = await saveGroupByCode(groupInfo.code, {
         ...groupPayload,
         updatedAt: Date.now(),
       });
-      if (ok) {
-        lastSyncedRef.current = snapshot;
+      if (mergedResult && mergedResult.groupInfo) {
+        const mergedNorm = normalizeGroupPayload(mergedResult);
+        const mergedSnap = JSON.stringify(mergedNorm);
+        lastSyncedRef.current = mergedSnap;
         dirtyRef.current = false;
+        if (mergedResult.cloudBlobId && mergedResult.cloudBlobId !== cloudBlobId) {
+          setCloudBlobId(mergedResult.cloudBlobId);
+        }
+        if ((mergedResult.members || []).length !== members.length) {
+          applyLoadedGroupData(mergedResult, currentUserId);
+        }
       }
-    }, 1200);
+    }, 600);
     return () => clearTimeout(timer);
   }, [
+    cloudBlobId,
     groupInfo,
     members,
     currentUserId,
@@ -941,6 +1772,7 @@ function App() {
     dailyDeputyPermissions,
     attendance,
     deleteConfirmations,
+    deletedIds,
     studentGroupBindings,
     weekAnchor,
   ]);
@@ -999,7 +1831,10 @@ function App() {
   const resetAllData = (customMsg = 'Группа успешно удалена.') => {
     if (groupInfo?.code) {
       removeLocalGroupFromRegistry(groupInfo.code);
-      saveGroupByCode(groupInfo.code, { deleted: true });
+      saveGroupByCode(groupInfo.code, {
+        deleted: true,
+        groupName: groupInfo.name,
+      });
     }
     try {
       localStorage.removeItem(STORAGE_KEY);
@@ -1014,6 +1849,8 @@ function App() {
     } catch {
       // Ignore
     }
+    setCloudBlobId('');
+    setDeletedIds(EMPTY_DELETED_IDS);
     setGroupInfo(null);
     setMembers([]);
     setCurrentUserId('');
@@ -1033,6 +1870,7 @@ function App() {
     missCountRef.current = 0;
     setStudentGroupBindings({});
     setSelectedStudentProfileId(null);
+    setExistingGroupConflict(null);
     setEntryRoleStep('choose');
     setScreenMode('entry');
     showToast(customMsg);
@@ -1044,9 +1882,14 @@ function App() {
       return;
     }
 
+    const nowTs = Date.now();
     if (currentUser.role === 'starosta') {
       if (deleteConfirmations.starosta) {
-        setDeleteConfirmations((prev) => ({ ...prev, starosta: false }));
+        setDeleteConfirmations((prev) => ({
+          ...prev,
+          starosta: false,
+          starostaTs: nowTs,
+        }));
         showToast('Подтверждение удаления группы со стороны старосты отменено.');
         return;
       }
@@ -1054,11 +1897,19 @@ function App() {
         resetAllData('Староста и заместитель подтвердили удаление (2/2). Группа полностью удалена.');
         return;
       }
-      setDeleteConfirmations((prev) => ({ ...prev, starosta: true }));
+      setDeleteConfirmations((prev) => ({
+        ...prev,
+        starosta: true,
+        starostaTs: nowTs,
+      }));
       showToast('Староста подтвердил(а) удаление (1/2). Группа удалится после подтверждения замстаросты.');
     } else if (currentUser.role === 'deputy') {
       if (deleteConfirmations.deputy) {
-        setDeleteConfirmations((prev) => ({ ...prev, deputy: false }));
+        setDeleteConfirmations((prev) => ({
+          ...prev,
+          deputy: false,
+          deputyTs: nowTs,
+        }));
         showToast('Подтверждение удаления группы со стороны замстаросты отменено.');
         return;
       }
@@ -1066,7 +1917,11 @@ function App() {
         resetAllData('Староста и заместитель подтвердили удаление (2/2). Группа полностью удалена.');
         return;
       }
-      setDeleteConfirmations((prev) => ({ ...prev, deputy: true }));
+      setDeleteConfirmations((prev) => ({
+        ...prev,
+        deputy: true,
+        deputyTs: nowTs,
+      }));
       showToast('Замстароста подтвердил(а) удаление (1/2). Группа удалится после подтверждения старосты.');
     }
   };
@@ -1098,6 +1953,10 @@ function App() {
       return;
     }
 
+    setDeletedIds((prev) => ({
+      ...prev,
+      members: { ...(prev.members || {}), [memberId]: Date.now() },
+    }));
     setMembers((prev) => prev.filter((m) => m.id !== memberId));
     setDailyDeputyByDay((prev) => {
       const next = { ...prev };
@@ -1316,9 +2175,58 @@ function App() {
     return `🎓 Присоединяйтесь к учебной группе «${groupInfo.name}» (${groupInfo.university}, ${groupInfo.course}) в мини-приложении Староста.ВК!\n\n🔑 Идентификатор (код) группы: ${groupInfo.code}\n🔗 Ссылка для вступления: ${groupInfo.inviteLink}\n\nВ приложении доступно расписание (числитель/знаменатель), домашние задания на каждую пару и план на следующую неделю.`;
   }, [groupInfo]);
 
-  // Создание группы (без обязательного ввода старосты и замстаросты в начале — они добавляются/назначаются позже)
-  const handleCreateGroupByStarosta = async (e) => {
-    e.preventDefault();
+  // Быстрое пакетное добавление студентов (по одному или списком)
+  const handleQuickAddBulkStudents = () => {
+    const lines = quickBulkStudentsText
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) {
+      showToast('Введите хотя бы одно Имя и Фамилию студента');
+      return;
+    }
+    const nowTs = Date.now();
+    const addedList = [];
+    lines.forEach((line, idx) => {
+      const cleanName = line.replace(/^\d+[.)\s-]+/, '').trim();
+      if (!cleanName) return;
+      const exists = members.some(
+        (m) => m.name.trim().toLowerCase() === cleanName.toLowerCase()
+      );
+      if (!exists) {
+        addedList.push({
+          id: `u_${nowTs}_${idx}`,
+          vkId: '',
+          groupCode: groupInfo?.code || '',
+          name: cleanName,
+          vkTag: '@vk_student',
+          subgroup: 1,
+          role: 'member',
+          avatarColor: 'bg-emerald-600',
+          joinedAt: nowTs,
+          updatedAt: nowTs,
+          permissions: {
+            canManageHomework: false,
+            canMarkAttendance: false,
+            canEditSchedule: false,
+            canManageQueues: false,
+            canPostAnnouncements: false,
+          },
+        });
+      }
+    });
+    if (addedList.length === 0) {
+      showToast('Указанные студенты уже есть в списке группы');
+      return;
+    }
+    setMembers((prev) => [...prev, ...addedList]);
+    setQuickBulkStudentsText('');
+    showToast(`Добавлено участников в группу: ${addedList.length} чел.`);
+  };
+
+  // Создание группы (с проверкой на дубликат в облаке, чтобы случайно не создать пустую копию существующей группы)
+  const handleCreateGroupByStarosta = async (e, forceCreateNew = false) => {
+    if (e && e.preventDefault) e.preventDefault();
     const grpName = createGroupForm.groupName.trim();
 
     if (!grpName) {
@@ -1326,114 +2234,136 @@ function App() {
       return;
     }
 
-    await requestBotMessagesPermission();
+    setIsSyncingCloud(true);
+    try {
+      await requestBotMessagesPermission();
 
-    const uniName =
-      createGroupForm.university === 'custom'
-        ? createGroupForm.customUniversity.trim() || 'Учебное заведение'
-        : createGroupForm.university;
+      // Проверяем, не создана ли уже группа с таким названием в облаке
+      if (!forceCreateNew) {
+        const existingCheck = await fetchGroupByCode(grpName);
+        if (
+          existingCheck &&
+          existingCheck.data &&
+          existingCheck.data.groupInfo &&
+          normalizeGroupNameKey(existingCheck.data.groupInfo.name) ===
+            normalizeGroupNameKey(grpName)
+        ) {
+          setExistingGroupConflict(existingCheck.data);
+          showToast(
+            `Группа «${existingCheck.data.groupInfo.name}» уже существует! Вы можете войти в неё.`
+          );
+          return;
+        }
+      }
 
-    const cleanSlug =
-      grpName
-        .toUpperCase()
-        .replace(/[^A-ZА-Я0-9]/g, '')
-        .slice(0, 6) || 'GRP';
-    const randomDigits = Math.floor(1000 + Math.random() * 9000);
-    const generatedCode = `VK-${cleanSlug}-${randomDigits}`;
-    const generatedLink = `https://vk.com/app${vkAppId}#join=${generatedCode}`;
+      setExistingGroupConflict(null);
 
-    const myVkId = vkUser?.id ? String(vkUser.id) : getLaunchVkUserId();
-    const autoVkName = vkUser
-      ? `${vkUser.first_name} ${vkUser.last_name || ''}`.trim()
-      : '';
-    const initialStarostaName =
-      createGroupForm.starostaName.trim() || autoVkName || 'Староста группы';
-    const initialStarostaTag =
-      createGroupForm.starostaVkTag.trim() ||
-      (myVkId ? `@id${myVkId}` : '@starosta');
+      const uniName =
+        createGroupForm.university === 'custom'
+          ? createGroupForm.customUniversity.trim() || 'Учебное заведение'
+          : createGroupForm.university;
 
-    const initialMembersList = [
-      {
-        id: 'u1',
-        vkId: myVkId,
-        groupCode: generatedCode,
-        name: initialStarostaName,
-        vkTag: initialStarostaTag,
-        subgroup: 1,
-        role: 'starosta',
-        avatarColor: 'bg-blue-600',
-        permissions: {
-          canManageHomework: true,
-          canMarkAttendance: true,
-          canEditSchedule: true,
-          canManageQueues: true,
-          canPostAnnouncements: true,
+      const cleanSlug =
+        grpName
+          .toUpperCase()
+          .replace(/[^A-ZА-ЯЁ0-9]/gi, '')
+          .slice(0, 6) || 'GRP';
+      const randomDigits = Math.floor(1000 + Math.random() * 9000);
+      const generatedCode = `VK-${cleanSlug}-${randomDigits}`;
+      const generatedLink = `https://vk.com/app${vkAppId}#join=${generatedCode}`;
+
+      const myVkId = vkUser?.id ? String(vkUser.id) : getLaunchVkUserId();
+      const autoVkName = vkUser
+        ? `${vkUser.first_name} ${vkUser.last_name || ''}`.trim()
+        : '';
+      const initialStarostaName =
+        createGroupForm.starostaName.trim() || autoVkName || 'Староста группы';
+      const initialStarostaTag =
+        createGroupForm.starostaVkTag.trim() ||
+        (myVkId ? `@id${myVkId}` : '@starosta');
+
+      const nowTs = Date.now();
+      const initialMembersList = [
+        {
+          id: 'u1',
+          vkId: myVkId,
+          groupCode: generatedCode,
+          name: initialStarostaName,
+          vkTag: initialStarostaTag,
+          subgroup: 1,
+          role: 'starosta',
+          avatarColor: 'bg-blue-600',
+          joinedAt: nowTs,
+          updatedAt: nowTs,
+          permissions: {
+            canManageHomework: true,
+            canMarkAttendance: true,
+            canEditSchedule: true,
+            canManageQueues: true,
+            canPostAnnouncements: true,
+          },
         },
-      },
-    ];
+      ];
 
-    const newGroupInfo = {
-      name: grpName,
-      university: uniName,
-      faculty: createGroupForm.faculty.trim() || 'Факультет не указан',
-      course: createGroupForm.course,
-      code: generatedCode,
-      inviteLink: generatedLink,
-    };
+      const newGroupInfo = {
+        name: grpName,
+        university: uniName,
+        faculty: createGroupForm.faculty.trim() || 'Факультет не указан',
+        course: createGroupForm.course,
+        code: generatedCode,
+        inviteLink: generatedLink,
+      };
 
-    const initialAnchor = makeAnchor(createGroupForm.initialWeekType);
-    const initialGroupPayload = {
-      groupInfo: newGroupInfo,
-      members: initialMembersList,
-      schedule: [],
-      homeworks: [],
-      queues: [],
-      funds: [],
-      botBroadcasts: [],
-      dailyDeputyByDay: EMPTY_DAILY_DEPUTY,
-      dailyAbsenceReasonByDay: EMPTY_DAILY_REASON,
-      attendance: {},
-      deleteConfirmations: { starosta: false, deputy: false },
-      dailyDeputyPermissions: DEFAULT_DAILY_PERMS,
-      weekAnchor: initialAnchor,
-      updatedAt: Date.now(),
-    };
+      const initialAnchor = makeAnchor(createGroupForm.initialWeekType);
+      const initialGroupPayload = {
+        cloudBlobId: '',
+        groupInfo: newGroupInfo,
+        members: initialMembersList,
+        schedule: [],
+        homeworks: [],
+        queues: [],
+        funds: [],
+        botBroadcasts: [],
+        dailyDeputyByDay: EMPTY_DAILY_DEPUTY,
+        dailyAbsenceReasonByDay: EMPTY_DAILY_REASON,
+        attendance: {},
+        deleteConfirmations: { starosta: false, deputy: false },
+        deletedIds: EMPTY_DELETED_IDS,
+        dailyDeputyPermissions: DEFAULT_DAILY_PERMS,
+        weekAnchor: initialAnchor,
+        updatedAt: nowTs,
+      };
 
-    setGroupInfo(newGroupInfo);
-    setMembers(initialMembersList);
-    setCurrentUserId('u1');
-    setSchedule([]);
-    setHomeworks([]);
-    setQueues([]);
-    setFunds([]);
-    setBotBroadcasts([]);
-    setDailyDeputyByDay(EMPTY_DAILY_DEPUTY);
-    setDailyAbsenceReasonByDay(EMPTY_DAILY_REASON);
-    setAttendance({});
-    setDeleteConfirmations({ starosta: false, deputy: false });
-    setWeekAnchor(initialAnchor);
-    setActiveWeekType(createGroupForm.initialWeekType);
+      applyLoadedGroupData(initialGroupPayload, 'u1');
 
-    lastSyncedRef.current = JSON.stringify(normalizeGroupPayload(initialGroupPayload));
-    const savedOk = await saveGroupByCode(generatedCode, initialGroupPayload, myVkId);
-    if (!savedOk) {
-      lastSyncedRef.current = ''; // повторим сохранение автоматически
+      const savedPayload = await saveGroupByCode(
+        generatedCode,
+        initialGroupPayload,
+        myVkId,
+        { skipRemoteMerge: true, registerInDirectory: true }
+      );
+      if (savedPayload && savedPayload.groupInfo) {
+        applyLoadedGroupData(savedPayload, 'u1');
+      }
+
+      setEntryRoleStep('starosta_created_code');
+      showToast(`Группа «${grpName}» создана и сохранена в облаке! Код: ${generatedCode}`);
+    } finally {
+      setIsSyncingCloud(false);
     }
-
-    setEntryRoleStep('starosta_created_code');
-    showToast(`Группа «${grpName}» создана! Код: ${generatedCode}`);
   };
 
-  // Вход студента в существующую группу по коду (добавляет студента в общую группу к старосте, НЕ создавая новую группу)
+  // Вход студента в существующую группу по коду, названию группы или ссылке (добавляет в общую группу к старосте)
   const handleStudentJoinGroup = async (e) => {
-    e.preventDefault();
-    const cleanEntered = studentJoinForm.enteredCode.trim().toUpperCase();
+    if (e && e.preventDefault) e.preventDefault();
+    const rawEntered = studentJoinForm.enteredCode.trim();
+    const { code: cleanEntered } = extractCodeAndSeedFromInput(rawEntered);
     const studentName = studentJoinForm.studentName.trim();
 
     if (!cleanEntered) {
       setStudentJoinForm((prev) => ({
         ...prev,
-        error: 'Пожалуйста, введите идентификатор (код) группы.',
+        error: 'Пожалуйста, введите код группы, название группы или вставьте ссылку приглашения.',
       }));
       return;
     }
@@ -1446,130 +2376,166 @@ function App() {
       return;
     }
 
-    const myVkId = vkUser?.id ? String(vkUser.id) : getLaunchVkUserId();
-    const normName = studentName.toLowerCase();
-    const rawTag =
-      studentJoinForm.studentVkTag.trim() || (myVkId ? `@id${myVkId}` : '@vk_student');
-    const normTag = rawTag.toLowerCase();
+    setIsSyncingCloud(true);
+    try {
+      await requestBotMessagesPermission();
 
-    const existingBoundCode =
-      studentGroupBindings[normName] ||
-      (normTag ? studentGroupBindings[normTag] : null) ||
-      (myVkId ? studentGroupBindings[myVkId] : null);
+      // 1. Сначала ищем существующую группу в облаке и реестре (по коду, названию или ссылке)
+      const found = await fetchGroupByCode(rawEntered);
+      if (!found || !found.data || !found.data.groupInfo) {
+        setStudentJoinForm((prev) => ({
+          ...prev,
+          error: `Группа «${rawEntered}» не найдена в облаке. Проверьте код у старосты или выберите группу из списка ниже.`,
+        }));
+        return;
+      }
 
-    if (existingBoundCode && existingBoundCode.toUpperCase() !== cleanEntered) {
-      setStudentJoinForm((prev) => ({
-        ...prev,
-        error: `Вы уже состоите в учебной группе с кодом «${existingBoundCode}». Студент может состоять только в одной группе и не может войти в другую.`,
-      }));
-      return;
-    }
+      const targetGroup = found.data;
+      const actualGroupCode = normalizeCodeKey(targetGroup.groupInfo.code);
+      const myVkId = vkUser?.id ? String(vkUser.id) : getLaunchVkUserId();
+      const normName = studentName.toLowerCase();
+      const rawTag =
+        studentJoinForm.studentVkTag.trim() ||
+        (myVkId ? `@id${myVkId}` : '@vk_student');
+      const normTag = rawTag.toLowerCase();
 
-    if (groupInfo && cleanEntered !== groupInfo.code.toUpperCase()) {
-      setStudentJoinForm((prev) => ({
-        ...prev,
-        error: `Вы уже состоите в группе «${groupInfo.name}» (${groupInfo.code}). Вступить во вторую группу нельзя, пока староста не исключит вас из текущей.`,
-      }));
-      return;
-    }
+      // Проверка привязки студента к другой группе (студент не может состоять в двух группах одновременно)
+      const existingBoundCode =
+        studentGroupBindings[normName] ||
+        (normTag && normTag !== '@vk_student' ? studentGroupBindings[normTag] : null) ||
+        (myVkId ? studentGroupBindings[myVkId] : null);
 
-    await requestBotMessagesPermission();
+      if (
+        existingBoundCode &&
+        normalizeCodeKey(existingBoundCode) !== actualGroupCode
+      ) {
+        setStudentJoinForm((prev) => ({
+          ...prev,
+          error: `Вы уже состоите в учебной группе с кодом «${existingBoundCode}». Студент может состоять только в одной группе.`,
+        }));
+        return;
+      }
 
-    // Ищем существующую группу, созданную старостой, в облаке ВК и реестре
-    const found = await fetchGroupByCode(cleanEntered);
-    if (!found || !found.data || !found.data.groupInfo) {
-      setStudentJoinForm((prev) => ({
-        ...prev,
-        error: `Группа с кодом «${cleanEntered}» не найдена. Проверьте правильность кода у старосты.`,
-      }));
-      return;
-    }
+      if (
+        groupInfo &&
+        normalizeCodeKey(groupInfo.code) !== actualGroupCode
+      ) {
+        setStudentJoinForm((prev) => ({
+          ...prev,
+          error: `Вы уже состоите в группе «${groupInfo.name}» (${groupInfo.code}). Вступить во вторую группу нельзя, пока староста не исключит вас из текущей.`,
+        }));
+        return;
+      }
 
-    const targetGroup = found.data;
-    const currentMembers = targetGroup.members || [];
+      const currentMembers = targetGroup.members || [];
+      const nowTs = Date.now();
 
-    // Проверяем, есть ли уже этот участник в списке группы (по VK ID, тегу или имени)
-    // Участника узнаём ТОЛЬКО по VK ID. По имени/тегу можно «забрать» лишь карточку,
-    // добавленную вручную старостой (без VK ID) и без особых ролей — иначе можно выдать себя за старосту.
-    const existingMember = currentMembers.find(
-      (m) =>
-        (myVkId && m.vkId && String(m.vkId) === String(myVkId)) ||
-        (!m.vkId &&
-          m.role === 'member' &&
-          (m.name.trim().toLowerCase() === normName ||
-            (normTag && m.vkTag && m.vkTag.trim().toLowerCase() === normTag)))
-    );
-
-    if (
-      !existingMember &&
-      currentMembers.some((m) => m.name.trim().toLowerCase() === normName)
-    ) {
-      setStudentJoinForm((prev) => ({
-        ...prev,
-        error:
-          'Участник с таким именем уже есть в группе. Добавьте к имени отчество или инициал, либо попросите старосту удалить дубль.',
-      }));
-      return;
-    }
-
-    let activeMemberId = '';
-    let updatedMembers = currentMembers;
-
-    if (existingMember) {
-      activeMemberId = existingMember.id;
-      updatedMembers = currentMembers.map((m) =>
-        m.id === existingMember.id
-          ? {
-              ...m,
-              vkId: myVkId || m.vkId || '',
-              vkTag: rawTag || m.vkTag,
-              groupCode: targetGroup.groupInfo.code,
-            }
-          : m
+      // 2. Проверяем, есть ли уже этот участник в списке группы (по VK ID, имени или тегу)
+      const existingMember = currentMembers.find(
+        (m) =>
+          (myVkId && m.vkId && String(m.vkId) === String(myVkId)) ||
+          m.name.trim().toLowerCase() === normName ||
+          (normTag &&
+            normTag !== '@vk_student' &&
+            m.vkTag &&
+            m.vkTag.trim().toLowerCase() === normTag)
       );
-      showToast(`Добро пожаловать в группу «${targetGroup.groupInfo.name}», ${existingMember.name}!`);
-    } else {
-      activeMemberId = myVkId ? `u_${myVkId}` : 'u_' + Date.now();
-      const newStudent = {
-        id: activeMemberId,
-        vkId: myVkId,
-        groupCode: targetGroup.groupInfo.code,
-        name: studentName,
-        vkTag: rawTag,
-        subgroup: Number(studentJoinForm.subgroup) || 1,
-        role: 'member',
-        avatarColor: 'bg-emerald-600',
-        permissions: {
-          canManageHomework: false,
-          canMarkAttendance: false,
-          canEditSchedule: false,
-          canManageQueues: false,
-          canPostAnnouncements: false,
+
+      let activeMemberId = '';
+      let updatedMembers = currentMembers;
+
+      if (existingMember) {
+        activeMemberId = existingMember.id;
+        updatedMembers = currentMembers.map((m) =>
+          m.id === existingMember.id
+            ? {
+                ...m,
+                name:
+                  m.name === 'Староста группы' || m.name === 'Староста'
+                    ? studentName
+                    : m.name,
+                vkId: myVkId || m.vkId || '',
+                vkTag:
+                  rawTag && rawTag !== '@vk_student'
+                    ? rawTag
+                    : m.vkTag || rawTag,
+                subgroup: Number(studentJoinForm.subgroup) || m.subgroup || 1,
+                groupCode: actualGroupCode,
+                joinedAt: nowTs,
+                updatedAt: nowTs,
+              }
+            : m
+        );
+        showToast(
+          `С возвращением в группу «${targetGroup.groupInfo.name}», ${studentName}!`
+        );
+      } else {
+        activeMemberId = myVkId ? `u_${myVkId}` : 'u_' + nowTs;
+        const newStudent = {
+          id: activeMemberId,
+          vkId: myVkId,
+          groupCode: actualGroupCode,
+          name: studentName,
+          vkTag: rawTag,
+          subgroup: Number(studentJoinForm.subgroup) || 1,
+          role: 'member',
+          avatarColor: 'bg-emerald-600',
+          joinedAt: nowTs,
+          updatedAt: nowTs,
+          permissions: {
+            canManageHomework: false,
+            canMarkAttendance: false,
+            canEditSchedule: false,
+            canManageQueues: false,
+            canPostAnnouncements: false,
+          },
+        };
+        updatedMembers = [...currentMembers, newStudent];
+        showToast(
+          `Вы успешно вступили в группу «${targetGroup.groupInfo.name}»! Участников: ${updatedMembers.length}`
+        );
+      }
+
+      // Снимаем метку удаления для этого участника, если он вступает повторно
+      const nextDeletedMembers = { ...(targetGroup.deletedIds?.members || {}) };
+      delete nextDeletedMembers[activeMemberId];
+
+      const updatedGroupPayload = {
+        ...targetGroup,
+        members: updatedMembers,
+        deletedIds: {
+          ...(targetGroup.deletedIds || EMPTY_DELETED_IDS),
+          members: nextDeletedMembers,
         },
+        updatedAt: nowTs,
       };
-      updatedMembers = [...currentMembers, newStudent];
-      showToast(`Вы добавлены в группу «${targetGroup.groupInfo.name}»!`);
+
+      applyLoadedGroupData(updatedGroupPayload, activeMemberId);
+
+      setStudentGroupBindings((prev) => ({
+        ...prev,
+        [normName]: actualGroupCode,
+        ...(normTag && normTag !== '@vk_student'
+          ? { [normTag]: actualGroupCode }
+          : {}),
+        ...(myVkId ? { [myVkId]: actualGroupCode } : {}),
+      }));
+
+      const syncedGroup = await saveGroupByCode(
+        actualGroupCode,
+        updatedGroupPayload,
+        myVkId,
+        { registerInDirectory: true }
+      );
+      if (syncedGroup && syncedGroup.groupInfo) {
+        applyLoadedGroupData(syncedGroup, activeMemberId);
+      }
+
+      setStudentJoinForm((prev) => ({ ...prev, error: '' }));
+      setScreenMode('app');
+    } finally {
+      setIsSyncingCloud(false);
     }
-
-    const updatedGroupPayload = {
-      ...targetGroup,
-      members: updatedMembers,
-      updatedAt: Date.now(),
-    };
-
-    applyLoadedGroupData(updatedGroupPayload, activeMemberId);
-
-    setStudentGroupBindings((prev) => ({
-      ...prev,
-      [normName]: targetGroup.groupInfo.code,
-      ...(normTag ? { [normTag]: targetGroup.groupInfo.code } : {}),
-      ...(myVkId ? { [myVkId]: targetGroup.groupInfo.code } : {}),
-    }));
-
-    await saveGroupByCode(targetGroup.groupInfo.code, updatedGroupPayload, myVkId);
-
-    setStudentJoinForm((prev) => ({ ...prev, error: '' }));
-    setScreenMode('app');
   };
 
   // Отправка важного сообщения от имени единого бота ВК строго участникам ТЕКУЩЕЙ учебной группы
@@ -1795,6 +2761,10 @@ function App() {
       showToast('Нет доступа к удалению ДЗ');
       return;
     }
+    setDeletedIds((prev) => ({
+      ...prev,
+      homeworks: { ...(prev.homeworks || {}), [hwId]: Date.now() },
+    }));
     setHomeworks((prev) => prev.filter((h) => h.id !== hwId));
     showToast('Домашнее задание удалено');
   };
@@ -1917,6 +2887,10 @@ function App() {
       showToast('Нет прав на удаление пары из расписания');
       return;
     }
+    setDeletedIds((prev) => ({
+      ...prev,
+      schedule: { ...(prev.schedule || {}), [pairId]: Date.now() },
+    }));
     setSchedule((prev) => prev.filter((p) => p.id !== pairId));
     setHomeworks((prev) => prev.filter((hw) => hw.scheduleId !== pairId));
     showToast('Пара удалена из расписания');
@@ -2163,7 +3137,7 @@ function App() {
           {/* STEP 1A: STAROSTA CREATES GROUP */}
           {entryRoleStep === 'starosta_create' && (
             <form
-              onSubmit={handleCreateGroupByStarosta}
+              onSubmit={(e) => handleCreateGroupByStarosta(e, false)}
               className={`rounded-3xl border p-6 sm:p-8 space-y-4 ${
                 darkMode
                   ? 'bg-slate-900 border-slate-800'
@@ -2173,7 +3147,7 @@ function App() {
               <div className="flex items-center justify-between">
                 <div>
                   <span className="text-xs font-bold uppercase tracking-wider text-[#2688EB]">
-                    Регистрация старосты
+                    Регистрация новой группы
                   </span>
                   <h2 className="text-lg sm:text-xl font-extrabold">
                     Создание учебной группы в ВУЗе
@@ -2181,12 +3155,65 @@ function App() {
                 </div>
                 <button
                   type="button"
-                  onClick={() => setEntryRoleStep('choose')}
+                  onClick={() => {
+                    setExistingGroupConflict(null);
+                    setEntryRoleStep('choose');
+                  }}
                   className="text-xs px-3 py-1.5 rounded-xl bg-slate-500/10 hover:bg-slate-500/20 font-semibold"
                 >
                   ← Назад
                 </button>
               </div>
+
+              {/* Защита от случайного создания пустой копии существующей группы */}
+              {existingGroupConflict && existingGroupConflict.groupInfo && (
+                <div
+                  className={`p-4 rounded-2xl border-2 border-amber-500/50 space-y-3 text-xs ${
+                    darkMode
+                      ? 'bg-amber-950/30 text-amber-100'
+                      : 'bg-amber-50 text-slate-900'
+                  }`}
+                >
+                  <div className="flex items-start gap-2.5">
+                    <AlertCircle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
+                    <div>
+                      <div className="font-bold text-sm">
+                        Группа «{existingGroupConflict.groupInfo.name}» уже существует в облаке!
+                      </div>
+                      <p className="mt-0.5 text-slate-600 dark:text-slate-300">
+                        Код группы: <strong className="text-[#2688EB]">{existingGroupConflict.groupInfo.code}</strong> • ВУЗ: {existingGroupConflict.groupInfo.university} • Участников: <strong>{(existingGroupConflict.members || []).length} чел.</strong>
+                      </p>
+                      <p className="mt-1 text-slate-500">
+                        Чтобы не создавать пустую вторую группу без участников, войдите в уже существующую группу:
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setStudentJoinForm((prev) => ({
+                          ...prev,
+                          enteredCode: existingGroupConflict.groupInfo.code,
+                          error: '',
+                        }));
+                        setExistingGroupConflict(null);
+                        setEntryRoleStep('student_join');
+                      }}
+                      className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs flex items-center gap-1.5"
+                    >
+                      <Users className="w-4 h-4" /> Присоединиться к «{existingGroupConflict.groupInfo.name}» ({existingGroupConflict.groupInfo.code})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => handleCreateGroupByStarosta(e, true)}
+                      className="px-3 py-2 rounded-xl border border-amber-500/40 hover:bg-amber-500/15 font-semibold text-xs"
+                    >
+                      Всё равно создать новую группу
+                    </button>
+                  </div>
+                </div>
+              )}
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs sm:text-sm">
                 <div>
@@ -2197,13 +3224,14 @@ function App() {
                     type="text"
                     required
                     value={createGroupForm.groupName}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      setExistingGroupConflict(null);
                       setCreateGroupForm({
                         ...createGroupForm,
                         groupName: e.target.value,
-                      })
-                    }
-                    placeholder="Введите шифр/номер группы"
+                      });
+                    }}
+                    placeholder="Например: ИСП-21 или ББИ-241"
                     className={`w-full px-3.5 py-2.5 rounded-xl border font-semibold ${
                       darkMode
                         ? 'bg-slate-800 border-slate-700'
@@ -2292,29 +3320,51 @@ function App() {
                   </div>
                 )}
 
-                <div>
-                  <label className="block font-semibold mb-1">
-                    Факультет / Институт / Кафедра:
-                  </label>
-                  <input
-                    type="text"
-                    value={createGroupForm.faculty}
-                    onChange={(e) =>
-                      setCreateGroupForm({
-                        ...createGroupForm,
-                        faculty: e.target.value,
-                      })
-                    }
-                    placeholder="Укажите факультет или институт"
-                    className={`w-full px-3.5 py-2.5 rounded-xl border ${
-                      darkMode
-                        ? 'bg-slate-800 border-slate-700'
-                        : 'bg-slate-50 border-slate-200'
-                    }`}
-                  />
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block font-semibold mb-1">
+                      Факультет / Институт:
+                    </label>
+                    <input
+                      type="text"
+                      value={createGroupForm.faculty}
+                      onChange={(e) =>
+                        setCreateGroupForm({
+                          ...createGroupForm,
+                          faculty: e.target.value,
+                        })
+                      }
+                      placeholder="Укажите факультет или институт"
+                      className={`w-full px-3.5 py-2.5 rounded-xl border ${
+                        darkMode
+                          ? 'bg-slate-800 border-slate-700'
+                          : 'bg-slate-50 border-slate-200'
+                      }`}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold mb-1">
+                      ФИО старосты (можно указать позже):
+                    </label>
+                    <input
+                      type="text"
+                      value={createGroupForm.starostaName}
+                      onChange={(e) =>
+                        setCreateGroupForm({
+                          ...createGroupForm,
+                          starostaName: e.target.value,
+                        })
+                      }
+                      placeholder="Необязательно — можно добавить потом"
+                      className={`w-full px-3.5 py-2.5 rounded-xl border ${
+                        darkMode
+                          ? 'bg-slate-800 border-slate-700'
+                          : 'bg-slate-50 border-slate-200'
+                      }`}
+                    />
+                  </div>
                 </div>
-
-
 
                 <div>
                   <label className="block font-semibold mb-1">
@@ -2359,14 +3409,21 @@ function App() {
 
               <button
                 type="submit"
-                className="w-full py-3 rounded-2xl bg-[#2688EB] hover:bg-blue-600 text-white font-bold text-sm shadow-sm transition"
+                disabled={isSyncingCloud}
+                className="w-full py-3 rounded-2xl bg-[#2688EB] hover:bg-blue-600 disabled:opacity-60 text-white font-bold text-sm shadow-sm transition flex items-center justify-center gap-2"
               >
-                Создать группу и сгенерировать код со ссылкой
+                {isSyncingCloud ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" /> Синхронизация с облаком...
+                  </>
+                ) : (
+                  'Создать группу и получить код приглашения'
+                )}
               </button>
             </form>
           )}
 
-          {/* STEP 1B: GENERATED GROUP CODE & INVITE LINK SCREEN */}
+          {/* STEP 1B: GENERATED GROUP CODE, LIVE PARTICIPANTS SYNC & INVITE LINK SCREEN */}
           {entryRoleStep === 'starosta_created_code' && groupInfo && (
             <div
               className={`rounded-3xl border p-6 sm:p-8 space-y-5 ${
@@ -2375,21 +3432,31 @@ function App() {
                   : 'bg-white border-slate-200/90 shadow-sm'
               }`}
             >
-              <div className="flex items-center gap-3">
-                <div className="w-12 h-12 rounded-2xl bg-emerald-500 text-white flex items-center justify-center shrink-0">
-                  <Check className="w-6 h-6" />
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-3">
+                  <div className="w-12 h-12 rounded-2xl bg-emerald-500 text-white flex items-center justify-center shrink-0">
+                    <Check className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold uppercase tracking-wider text-emerald-500">
+                      Группа создана и синхронизирована в облаке
+                    </span>
+                    <h2 className="text-lg sm:text-xl font-extrabold">
+                      {groupInfo.name} • {groupInfo.university}
+                    </h2>
+                    <p className="text-xs text-slate-500">
+                      {groupInfo.faculty} ({groupInfo.course})
+                    </p>
+                  </div>
                 </div>
-                <div>
-                  <span className="text-xs font-bold uppercase tracking-wider text-emerald-500">
-                    Группа создана и готова к работе
-                  </span>
-                  <h2 className="text-lg sm:text-xl font-extrabold">
-                    {groupInfo.name} • {groupInfo.university}
-                  </h2>
-                  <p className="text-xs text-slate-500">
-                    {groupInfo.faculty} ({groupInfo.course})
-                  </p>
-                </div>
+                <button
+                  type="button"
+                  onClick={() => syncGroupFromCloudNow(false)}
+                  className="px-3 py-1.5 rounded-xl bg-[#2688EB]/10 text-[#2688EB] hover:bg-[#2688EB]/20 text-xs font-bold flex items-center gap-1.5"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncingCloud ? 'animate-spin' : ''}`} />
+                  Обновить ({members.length} чел.)
+                </button>
               </div>
 
               {/* Generated Group Code Box */}
@@ -2400,7 +3467,7 @@ function App() {
               >
                 <div>
                   <div className="text-xs text-slate-500 font-medium">
-                    Уникальный идентификатор (код) вашей группы:
+                    Код вашей группы (студенты могут вводить этот код ИЛИ просто название «{groupInfo.name}»):
                   </div>
                   <div className="text-xl sm:text-2xl font-black tracking-wider text-[#2688EB] mt-0.5">
                     {groupInfo.code}
@@ -2417,6 +3484,72 @@ function App() {
                 >
                   <Copy className="w-4 h-4" /> Скопировать код
                 </button>
+              </div>
+
+              {/* Quick Participants & Starosta Setup right on creation screen */}
+              <div
+                className={`p-4 rounded-2xl border space-y-3 ${
+                  darkMode
+                    ? 'bg-slate-800/50 border-slate-700'
+                    : 'bg-slate-50 border-slate-200'
+                }`}
+              >
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <div className="text-xs font-bold flex items-center gap-1.5">
+                    <Users className="w-4 h-4 text-[#2688EB]" />
+                    <span>Участники группы в облаке ({members.length} чел.)</span>
+                  </div>
+                  <span className="text-[11px] text-emerald-600 dark:text-emerald-400 font-semibold">
+                    ● Авто-синхронизация активна
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap gap-1.5">
+                  {members.map((m) => (
+                    <span
+                      key={m.id}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 border ${
+                        m.role === 'starosta'
+                          ? 'bg-[#2688EB]/15 border-[#2688EB]/30 text-[#2688EB]'
+                          : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      <span>{m.name}</span>
+                      {m.role === 'starosta' && (
+                        <span className="text-[10px] px-1.5 py-0.2 rounded bg-[#2688EB] text-white">
+                          Староста
+                        </span>
+                      )}
+                    </span>
+                  ))}
+                </div>
+
+                {/* Быстрое добавление списка студентов (по желанию) */}
+                <div className="pt-1 space-y-1.5">
+                  <label className="block text-xs font-semibold text-slate-500">
+                    Быстро внести список студентов (по одному в строке — или пусть входят сами по коду):
+                  </label>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <textarea
+                      rows={2}
+                      value={quickBulkStudentsText}
+                      onChange={(e) => setQuickBulkStudentsText(e.target.value)}
+                      placeholder={"Иван Иванов\nМария Петрова\nАлексей Смирнов"}
+                      className={`flex-1 px-3 py-2 rounded-xl border text-xs ${
+                        darkMode
+                          ? 'bg-slate-900 border-slate-700 text-white'
+                          : 'bg-white border-slate-200 text-slate-900'
+                      }`}
+                    />
+                    <button
+                      type="button"
+                      onClick={handleQuickAddBulkStudents}
+                      className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold shrink-0"
+                    >
+                      + Добавить в группу
+                    </button>
+                  </div>
+                </div>
               </div>
 
               {/* Generated Invite Text & Link Box */}
@@ -2454,7 +3587,7 @@ function App() {
             </div>
           )}
 
-          {/* STEP 2: STUDENT JOINS BY GROUP ID */}
+          {/* STEP 2: STUDENT JOINS BY GROUP ID OR GROUP NAME */}
           {entryRoleStep === 'student_join' && (
             <form
               onSubmit={handleStudentJoinGroup}
@@ -2467,10 +3600,10 @@ function App() {
               <div className="flex items-center justify-between">
                 <div>
                   <span className="text-xs font-bold uppercase tracking-wider text-emerald-600">
-                    Вход для студента
+                    Вход для участника группы
                   </span>
                   <h2 className="text-lg sm:text-xl font-extrabold">
-                    Вступление в группу по идентификатору
+                    Присоединиться к существующей группе
                   </h2>
                 </div>
                 <button
@@ -2482,10 +3615,10 @@ function App() {
                 </button>
               </div>
 
-              {/* Group ID input */}
+              {/* Group ID or Group Name input */}
               <div className="space-y-1.5">
                 <label className="block text-xs sm:text-sm font-bold">
-                  Идентификатор (код) вашей группы *:
+                  Код группы (VK-...), название группы или ссылка от старосты *:
                 </label>
                 <div className="flex items-center gap-2">
                   <div className="relative flex-1">
@@ -2501,8 +3634,8 @@ function App() {
                           error: '',
                         })
                       }
-                      placeholder="Введите код группы от старосты"
-                      className={`w-full pl-10 pr-3.5 py-2.5 rounded-xl border font-bold tracking-wider uppercase text-sm ${
+                      placeholder="Например: VK-ИСП21-4821 или просто ИСП-21"
+                      className={`w-full pl-10 pr-3.5 py-2.5 rounded-xl border font-bold tracking-wider text-sm ${
                         darkMode
                           ? 'bg-slate-800 border-slate-700'
                           : 'bg-slate-50 border-slate-200'
@@ -2526,6 +3659,61 @@ function App() {
                   )}
                 </div>
               </div>
+
+              {/* Cloud Directory Quick Picker */}
+              {cloudDirectoryGroups.length > 0 && (
+                <div
+                  className={`p-3 rounded-2xl border space-y-2 ${
+                    darkMode
+                      ? 'bg-slate-800/50 border-slate-700'
+                      : 'bg-slate-50 border-slate-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-bold text-slate-500">
+                      Доступные группы в облаке (нажмите для выбора):
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        fetchCloudGroupsDirectory().then((list) =>
+                          setCloudDirectoryGroups(list || [])
+                        )
+                      }
+                      className="text-[#2688EB] font-semibold hover:underline flex items-center gap-1"
+                    >
+                      <RefreshCw className="w-3 h-3" /> Обновить
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto">
+                    {cloudDirectoryGroups.map((g) => (
+                      <button
+                        key={g.code}
+                        type="button"
+                        onClick={() =>
+                          setStudentJoinForm((prev) => ({
+                            ...prev,
+                            enteredCode: g.code,
+                            error: '',
+                          }))
+                        }
+                        className={`px-3 py-1.5 rounded-xl border text-xs font-semibold text-left transition ${
+                          normalizeCodeKey(studentJoinForm.enteredCode) === g.code
+                            ? 'border-emerald-500 bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                            : darkMode
+                            ? 'bg-slate-900 border-slate-700 hover:border-slate-600'
+                            : 'bg-white border-slate-200 hover:border-slate-300'
+                        }`}
+                      >
+                        <span className="font-bold">{g.name}</span>{' '}
+                        <span className="text-[11px] text-slate-400">
+                          ({g.code} • {g.membersCount || 1} чел.)
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {studentJoinForm.error && (
                 <div className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-600 dark:text-rose-400 text-xs font-semibold flex items-center gap-2">
@@ -2583,9 +3771,16 @@ function App() {
 
               <button
                 type="submit"
-                className="w-full py-3 rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm shadow-sm transition"
+                disabled={isSyncingCloud}
+                className="w-full py-3 rounded-2xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white font-bold text-sm shadow-sm transition flex items-center justify-center gap-2"
               >
-                Войти в группу по идентификатору
+                {isSyncingCloud ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" /> Поиск группы и синхронизация...
+                  </>
+                ) : (
+                  'Войти в группу и синхронизировать участников'
+                )}
               </button>
             </form>
           )}
@@ -4574,15 +5769,20 @@ function App() {
                           type="button"
                           onClick={() => {
                             if (!starostaNameDraft.trim()) return;
+                            const nowTs = Date.now();
                             setMembers((prev) =>
                               prev.map((m) =>
                                 m.role === 'starosta'
-                                  ? { ...m, name: starostaNameDraft.trim() }
+                                  ? {
+                                      ...m,
+                                      name: starostaNameDraft.trim(),
+                                      updatedAt: nowTs,
+                                    }
                                   : m
                               )
                             );
                             setEditingStarostaName(false);
-                            showToast('ФИО старосты сохранено!');
+                            showToast('ФИО старосты сохранено и синхронизировано!');
                           }}
                           className="px-3 py-1.5 rounded-lg bg-[#2688EB] text-white text-xs font-bold"
                         >

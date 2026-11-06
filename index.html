@@ -154,8 +154,28 @@
       return '';
     };
 
-    const REGISTRY_STORAGE_KEY = 'starosta_vk_groups_registry_v2';
-    const POINTERS_KEY = 'starosta_vk_cloud_pointers_v1';
+    // 🧹 АВТОМАТИЧЕСКАЯ ОЧИСТКА ВСЕХ СТАРЫХ БАЗ И КЭША НА УСТРОЙСТВАХ
+    const LEGACY_STORAGE_KEYS = [
+      'starosta_vk_production_v1',
+      'starosta_vk_production_v2',
+      'starosta_vk_production_v3',
+      'starosta_vk_production_v4',
+      'starosta_vk_groups_registry_v1',
+      'starosta_vk_groups_registry_v2',
+      'starosta_vk_groups_registry_v3',
+      'starosta_vk_cloud_pointers_v1',
+      'starosta_vk_cloud_pointers_v2',
+      'starosta_vk_state',
+      'starosta_vk_data',
+    ];
+    try {
+      LEGACY_STORAGE_KEYS.forEach((k) => localStorage.removeItem(k));
+    } catch {
+      // Ignore
+    }
+
+    const REGISTRY_STORAGE_KEY = 'starosta_vk_groups_registry_clean_v5';
+    const POINTERS_KEY = 'starosta_vk_cloud_pointers_clean_v5';
     const VK_MESSAGE_LIMIT = 4000;
     const NTFY_BASE_URL = 'https://ntfy.sh';
     const JSONBLOB_API_URL = 'https://jsonblob.com/api/jsonBlob';
@@ -315,10 +335,10 @@
       const asciiPart =
         norm.replace(/[^A-Z0-9]/g, '').slice(0, 10).toLowerCase() || 'grp';
       const hash = hashStringHex(`${kind}:${norm}`);
-      return `stvk_${VK_MINI_APP_ID}_${kind}_${asciiPart}_${hash}`;
+      return `stvk5_${VK_MINI_APP_ID}_${kind}_${asciiPart}_${hash}`;
     };
 
-    const GLOBAL_DIRECTORY_TOPIC = `stvk_${VK_MINI_APP_ID}_dir_v4`;
+    const GLOBAL_DIRECTORY_TOPIC = `stvk5_${VK_MINI_APP_ID}_dir_clean_v5`;
 
     // Кодирование и декодирование компактного снимка группы для ссылки приглашения
     const encodeGroupSeed = (payload) => {
@@ -1249,7 +1269,7 @@ const UNIVERSITIES = [
   'НГУ (Новосибирский государственный университет)',
 ];
 
-const STORAGE_KEY = 'starosta_vk_production_v1';
+const STORAGE_KEY = 'starosta_vk_clean_v5';
 
 const EMPTY_DAILY_DEPUTY = {
   mon: null,
@@ -1704,6 +1724,9 @@ function App() {
         try {
           // VKWebAppInit уже отправлен в <head> сразу после загрузки скрипта
           setVkBridgeReady(true);
+          LEGACY_STORAGE_KEYS.forEach((k) => {
+            bridge.send('VKWebAppStorageSet', { key: k, value: '' }).catch(() => {});
+          });
           const userInfo = await bridge.send('VKWebAppGetUserInfo');
           if (userInfo && userInfo.first_name) {
             const fullName = `${userInfo.first_name} ${userInfo.last_name || ''}`.trim();

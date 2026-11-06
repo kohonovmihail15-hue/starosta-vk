@@ -7,6 +7,7 @@
   
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com/3.4.14"></script>
+  <script>tailwind.config = { darkMode: 'class' };</script>
   
   <!-- VK Bridge (Official VK CDN / jsDelivr, 100% working in RU) -->
   <script src="https://cdn.jsdelivr.net/npm/@vkontakte/vk-bridge@2.15.1/dist/browser.min.js"></script>
@@ -45,8 +46,324 @@
   </div>
 
   <script type="text/babel">
+    // ============================================================================
+    // 🔑 ГЛАВНАЯ НАСТРОЙКА БОТА ВК (В КОРНЕ ФАЙЛА НА GITHUB):
+    // Вставьте сюда ключ доступа (токен) вашего сообщества ВКонтакте.
+    // Один этот бот обслуживает ВСЕ созданные учебные группы и сам определяет,
+    // к какому сообществу он подключен и участникам какой именно группы слать сообщения.
+    // ============================================================================
+    const VK_BOT_TOKEN = "ВСТАВЬТЕ_СЮДА_ТОКЕН_СООБЩЕСТВА_ВК";
+    const VK_MINI_APP_ID = 54871400;
+    // АДРЕС ПРОКСИ-СЕРВЕРА (рекомендуется, см. server/proxy.js и README).
+    // Если указан — токен сообщества хранится только на сервере, а не в браузере.
+    // Если пуст — используется старый режим с токеном в этом файле (ТОЛЬКО для тестов!).
+    const VK_PROXY_URL = "";
 
-    const { useState, useMemo, useEffect } = React;
+    const { useState, useMemo, useEffect, useRef } = React;
+
+    // Вызов методов VK API через JSONP (работает напрямую из браузера в РФ без VPN)
+    const callVkApiDirect = (method, params = {}) => {
+      return new Promise((resolve) => {
+        const token = (params.access_token || VK_BOT_TOKEN || '').trim();
+        if (!token || token === 'ВСТАВЬТЕ_СЮДА_ТОКЕН_СООБЩЕСТВА_ВК') {
+          resolve({ error: { error_msg: 'No token' } });
+          return;
+        }
+        const cbName = 'vk_cb_' + Date.now() + '_' + Math.floor(Math.random() * 1000000);
+        const script = document.createElement('script');
+        const timer = setTimeout(() => {
+          if (window[cbName]) delete window[cbName];
+          if (script.parentNode) script.parentNode.removeChild(script);
+          resolve({ error: { error_msg: 'Timeout' } });
+        }, 7000);
+
+        window[cbName] = (data) => {
+          clearTimeout(timer);
+          delete window[cbName];
+          if (script.parentNode) script.parentNode.removeChild(script);
+          resolve(data || {});
+        };
+
+        const query = new URLSearchParams({
+          ...params,
+          access_token: token,
+          v: '5.199',
+          callback: cbName,
+        });
+        script.src = `https://api.vk.com/method/${method}?${query.toString()}`;
+        script.onerror = () => {
+          clearTimeout(timer);
+          if (window[cbName]) delete window[cbName];
+          if (script.parentNode) script.parentNode.removeChild(script);
+          resolve({ error: { error_msg: 'Network error' } });
+        };
+        document.body.appendChild(script);
+      });
+    };
+
+    const callVkApiViaProxy = async (method, params = {}) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 10000);
+      try {
+        const r = await fetch(VK_PROXY_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            method,
+            params,
+            launchParams: window.location.search.replace(/^\?/, ''),
+          }),
+          signal: ctrl.signal,
+        });
+        return (await r.json()) || {};
+      } catch {
+        return { error: { error_msg: 'Network error' } };
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    let tokenWarned = false;
+    const callVkApi = (method, params = {}) => {
+      if (VK_PROXY_URL) return callVkApiViaProxy(method, params);
+      if (!tokenWarned) {
+        tokenWarned = true;
+        console.warn('[Староста.ВК] Токен сообщества используется в браузере — это небезопасно. Настройте VK_PROXY_URL.');
+      }
+      return callVkApiDirect(method, params);
+    };
+
+    // Получение VK ID текущего пользователя из параметров запуска ВК
+    const getLaunchVkUserId = () => {
+      try {
+        const searchParams = new URLSearchParams(window.location.search);
+        const fromSearch = searchParams.get('vk_user_id');
+        if (fromSearch) return String(fromSearch);
+        const hash = window.location.hash || '';
+        if (hash.includes('vk_user_id=')) {
+          return hash.split('vk_user_id=')[1].split('&')[0];
+        }
+      } catch {
+        // Ignore
+      }
+      return '';
+    };
+
+    const REGISTRY_STORAGE_KEY = 'starosta_vk_groups_registry_v2';
+
+    const getLocalGroupsRegistry = () => {
+      try {
+        const raw = localStorage.getItem(REGISTRY_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : {};
+      } catch {
+        return {};
+      }
+    };
+
+    const setLocalGroupInRegistry = (code, groupPayload) => {
+      try {
+        const reg = getLocalGroupsRegistry();
+        reg[code.toUpperCase()] = groupPayload;
+        localStorage.setItem(REGISTRY_STORAGE_KEY, JSON.stringify(reg));
+      } catch {
+        // Ignore
+      }
+    };
+
+    const removeLocalGroupFromRegistry = (code) => {
+      try {
+        const reg = getLocalGroupsRegistry();
+        delete reg[code.toUpperCase()];
+        localStorage.setItem(REGISTRY_STORAGE_KEY, JSON.stringify(reg));
+      } catch {
+        // Ignore
+      }
+    };
+
+    // Извлечение JSON группы из текста системного сообщения бота ВК
+    const parseGroupMessageText = (text, code) => {
+      if (!text) return null;
+      const marker = `[GROUP_DB:${code.toUpperCase()}]`;
+      const idx = text.indexOf(marker);
+      if (idx === -1) return null;
+      const jsonStr = text.slice(idx + marker.length).trim();
+      try {
+        return JSON.parse(jsonStr);
+      } catch {
+        return null;
+      }
+    };
+
+    const POINTERS_KEY = 'starosta_vk_cloud_pointers_v1';
+    const VK_MESSAGE_LIMIT = 4000; // лимит ВК на одно сообщение — 4096 символов
+    let syncErrorHandler = null;
+
+    const getPointers = () => {
+      try {
+        return JSON.parse(localStorage.getItem(POINTERS_KEY) || '{}');
+      } catch {
+        return {};
+      }
+    };
+    const setPointer = (code, ptr) => {
+      try {
+        const all = getPointers();
+        if (ptr) all[code] = ptr;
+        else delete all[code];
+        localStorage.setItem(POINTERS_KEY, JSON.stringify(all));
+      } catch {
+        // Ignore
+      }
+    };
+
+    // messages.send может вернуть число, объект или массив — приводим к id сообщения
+    const extractMessageId = (res) => {
+      const r = res?.response;
+      if (typeof r === 'number') return r;
+      if (Array.isArray(r)) return r[0]?.message_id || null;
+      if (r && typeof r === 'object') return r.message_id || null;
+      return null;
+    };
+
+    // Поиск группы в облаке ВК (через сообщения бота) + локальном реестре
+    const fetchGroupByCode = async (rawCode) => {
+      const code = (rawCode || '').trim().toUpperCase();
+      if (!code) return null;
+
+      // 0. Если мы уже знаем сообщение этой группы — читаем его напрямую (не зависит от индекса поиска)
+      const ptr = getPointers()[code];
+      if (ptr?.msgId) {
+        const byId = await callVkApi('messages.getById', {
+          message_ids: String(ptr.msgId),
+        });
+        const item = byId?.response?.items?.[0];
+        const parsed = parseGroupMessageText(item?.text, code);
+        if (parsed) {
+          if (parsed.deleted) return { deleted: true, msgId: item.id, peerId: item.peer_id };
+          if (parsed.groupInfo) {
+            setLocalGroupInRegistry(code, parsed);
+            return { data: parsed, msgId: item.id, peerId: item.peer_id, source: 'cloud' };
+          }
+        }
+      }
+
+      // 1. Поиск по всем сообщениям бота (самые новые — первыми)
+      const searchRes = await callVkApi('messages.search', {
+        q: `[GROUP_DB:${code}]`,
+        count: 10,
+      });
+      if (searchRes?.response?.items?.length > 0) {
+        for (const item of searchRes.response.items) {
+          const parsed = parseGroupMessageText(item.text, code);
+          if (parsed) {
+            if (parsed.deleted) return { deleted: true, msgId: item.id, peerId: item.peer_id };
+            if (parsed.groupInfo) {
+              setLocalGroupInRegistry(code, parsed);
+              setPointer(code, { msgId: item.id, peerId: item.peer_id });
+              return { data: parsed, msgId: item.id, peerId: item.peer_id, source: 'cloud' };
+            }
+          }
+        }
+      }
+
+      // 2. Последние диалоги бота (на случай задержки индексации поиска)
+      const convRes = await callVkApi('messages.getConversations', { count: 20 });
+      if (convRes?.response?.items?.length > 0) {
+        for (const cItem of convRes.response.items) {
+          const lastMsg = cItem.last_message;
+          const parsed = parseGroupMessageText(lastMsg?.text, code);
+          if (!parsed) continue;
+          if (parsed.deleted) return { deleted: true, msgId: lastMsg.id, peerId: lastMsg.peer_id };
+          if (parsed.groupInfo) {
+            setLocalGroupInRegistry(code, parsed);
+            setPointer(code, { msgId: lastMsg.id, peerId: lastMsg.peer_id });
+            return { data: parsed, msgId: lastMsg.id, peerId: lastMsg.peer_id, source: 'cloud' };
+          }
+        }
+      }
+
+      // 3. Fallback к локальному реестру устройства
+      const localReg = getLocalGroupsRegistry();
+      if (localReg[code] && !localReg[code].deleted) {
+        return { data: localReg[code], msgId: null, peerId: null, source: 'local' };
+      }
+      return null;
+    };
+
+    // Сохранение состояния группы в облако бота ВК и локальный реестр. Возвращает true/false.
+    const saveGroupByCode = async (rawCode, groupPayload, preferredPeerId = '') => {
+      const code = (rawCode || '').trim().toUpperCase();
+      if (!code) return false;
+
+      setLocalGroupInRegistry(code, groupPayload);
+
+      const markerText = `📦 [GROUP_DB:${code}]\n${JSON.stringify(groupPayload)}`;
+      if (markerText.length > VK_MESSAGE_LIMIT) {
+        if (syncErrorHandler) {
+          syncErrorHandler(
+            'Данные группы превысили лимит ВК (4096 символов на сообщение): синхронизация между устройствами остановлена. Удалите лишнее или подключите сервер.'
+          );
+        }
+        return false;
+      }
+
+      let ptr = getPointers()[code] || null;
+      if (!ptr) {
+        const existing = await fetchGroupByCode(code);
+        if (existing && existing.source === 'cloud' && existing.msgId && existing.peerId) {
+          ptr = { msgId: existing.msgId, peerId: existing.peerId };
+        }
+      }
+
+      if (ptr) {
+        const editRes = await callVkApi('messages.edit', {
+          peer_id: String(ptr.peerId),
+          message_id: String(ptr.msgId),
+          message: markerText,
+        });
+        if (editRes && !editRes.error) return true;
+
+        // Сообщение нельзя редактировать (старше 24 ч) — отправляем новое, старое удаляем
+        const sendRes = await callVkApi('messages.send', {
+          peer_id: String(ptr.peerId),
+          random_id: String(Math.floor(Math.random() * 1e9)),
+          message: markerText,
+        });
+        const newId = extractMessageId(sendRes);
+        if (newId) {
+          setPointer(code, { msgId: newId, peerId: ptr.peerId });
+          await callVkApi('messages.delete', {
+            message_ids: String(ptr.msgId),
+            delete_for_all: 1,
+          });
+          return true;
+        }
+        return false;
+      }
+
+      // Записи в ВК ещё нет — находим подходящий peer_id
+      let targetPeer = preferredPeerId || getLaunchVkUserId();
+      if (!targetPeer) {
+        const convRes = await callVkApi('messages.getConversations', { count: 10 });
+        const allowedConv = convRes?.response?.items?.find(
+          (x) => x.conversation?.can_write?.allowed
+        );
+        if (allowedConv) targetPeer = String(allowedConv.conversation.peer.id);
+      }
+      if (!targetPeer) return false;
+
+      const sendRes = await callVkApi('messages.send', {
+        peer_id: String(targetPeer),
+        random_id: String(Math.floor(Math.random() * 1e9)),
+        message: markerText,
+      });
+      const newId = extractMessageId(sendRes);
+      if (newId) {
+        setPointer(code, { msgId: newId, peerId: targetPeer });
+        return true;
+      }
+      return false;
+    };
 
     // Helper SVG icon generator so all Lucide icons work without external bundler
     const createIcon = (svgPaths) => (props) => (
@@ -146,16 +463,85 @@ const EMPTY_DAILY_REASON = {
   sat: 'both_absent',
 };
 
+const DEFAULT_DAILY_PERMS = {
+  canManageHomework: true,
+  canMarkAttendance: true,
+  canManageQueues: true,
+};
+
+const DAY_IDS_BY_JS_DAY = ['mon', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const todayDayId = () => DAY_IDS_BY_JS_DAY[new Date().getDay()];
+const todayISO = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+// Номер дня (UTC) для понедельника той недели, которая считается «текущей» (воскресенье = уже следующая неделя)
+const mondayNum = (date) => {
+  const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  if (d.getDay() === 0) d.setDate(d.getDate() + 1);
+  const dayNum = Math.floor(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 86400000);
+  return dayNum - ((d.getDay() + 6) % 7);
+};
+const makeAnchor = (type = 'numerator', now = new Date()) => ({
+  mondayNum: mondayNum(now),
+  type: type === 'denominator' ? 'denominator' : 'numerator',
+});
+// Тип текущей недели считается автоматически по календарю от «якоря», заданного старостой
+const computeWeek = (anchor, now = new Date()) => {
+  const a = anchor && anchor.mondayNum ? anchor : makeAnchor('numerator', now);
+  const counter = Math.round((mondayNum(now) - a.mondayNum) / 7);
+  const flip = Math.abs(counter) % 2 === 1;
+  const type = flip ? (a.type === 'numerator' ? 'denominator' : 'numerator') : a.type;
+  return { counter, type };
+};
+
+const shuffleArray = (arr) => {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
+
+// Приведение данных группы к единому виду (значения по умолчанию, миграция старых данных)
+const normalizeGroupPayload = (d) => {
+  const weekAnchor = d.weekAnchor || makeAnchor(d.currentAcademicWeekType || 'numerator');
+  const counter = computeWeek(weekAnchor).counter;
+  return {
+    groupInfo: d.groupInfo,
+    members: d.members || [],
+    schedule: d.schedule || [],
+    homeworks: (d.homeworks || []).map((hw) =>
+      hw.dueWeek !== undefined
+        ? hw
+        : { ...hw, dueWeek: counter + (hw.targetWeekScope === 'next' ? 1 : 0) }
+    ),
+    queues: d.queues || [],
+    funds: d.funds || [],
+    botBroadcasts: d.botBroadcasts || [],
+    dailyDeputyByDay: d.dailyDeputyByDay || EMPTY_DAILY_DEPUTY,
+    dailyAbsenceReasonByDay: d.dailyAbsenceReasonByDay || EMPTY_DAILY_REASON,
+    dailyDeputyPermissions: d.dailyDeputyPermissions || DEFAULT_DAILY_PERMS,
+    attendance: d.attendance || {},
+    deleteConfirmations: d.deleteConfirmations || { starosta: false, deputy: false },
+    weekAnchor,
+  };
+};
+
 function App() {
   const [darkMode, setDarkMode] = useState(false);
 
   // VK Bridge status & VK User info
   const [vkBridgeReady, setVkBridgeReady] = useState(false);
   const [vkUser, setVkUser] = useState(null);
-  const [vkAppId, setVkAppId] = useState('54871400');
-  const [vkBotToken, setVkBotToken] = useState('');
-  const [vkChatPeerId, setVkChatPeerId] = useState('');
-  const [botSettingsOpen, setBotSettingsOpen] = useState(false);
+  const [vkAppId, setVkAppId] = useState(String(VK_MINI_APP_ID));
+  const [botCommunityId, setBotCommunityId] = useState('');
+  const [botCommunityName, setBotCommunityName] = useState('');
+  const [editingStarostaName, setEditingStarostaName] = useState(false);
+  const [starostaNameDraft, setStarostaNameDraft] = useState('');
+  const [deputyAddForm, setDeputyAddForm] = useState({ name: '', vkTag: '', subgroup: 1 });
   const [deleteConfirmations, setDeleteConfirmations] = useState({
     starosta: false,
     deputy: false,
@@ -206,17 +592,23 @@ function App() {
   const [dailyAbsenceReasonByDay, setDailyAbsenceReasonByDay] =
     useState(EMPTY_DAILY_REASON);
 
-  const [dailyDeputyPermissions, setDailyDeputyPermissions] = useState({
-    canManageHomework: true,
-    canMarkAttendance: true,
-    canManageQueues: true,
-  });
+  const [dailyDeputyPermissions, setDailyDeputyPermissions] =
+    useState(DEFAULT_DAILY_PERMS);
 
   // Week & schedule state (empty by default)
-  const [activeWeekType, setActiveWeekType] = useState('numerator');
-  const [currentAcademicWeekType, setCurrentAcademicWeekType] =
-    useState('numerator');
-  const [selectedDay, setSelectedDay] = useState('mon');
+  const [weekAnchor, setWeekAnchor] = useState(null);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  const weekInfo = useMemo(
+    () => computeWeek(weekAnchor, new Date(nowTick)),
+    [weekAnchor, nowTick]
+  );
+  const currentAcademicWeekType = weekInfo.type;
+  const currentWeekCounter = weekInfo.counter;
+  const [activeWeekType, setActiveWeekType] = useState(weekInfo.type);
+  const [selectedDay, setSelectedDay] = useState(todayDayId);
+  const lastSyncedRef = useRef('');
+  const dirtyRef = useRef(false);
+  const missCountRef = useRef(0);
   const [selectedSubgroup, setSelectedSubgroup] = useState(0);
   const [schedule, setSchedule] = useState([]);
   const [homeworks, setHomeworks] = useState([]);
@@ -229,6 +621,7 @@ function App() {
   // Attendance state
   const [attendanceSelectedPairId, setAttendanceSelectedPairId] = useState('');
   const [attendance, setAttendance] = useState({});
+  const [attendanceDate, setAttendanceDate] = useState(todayISO);
 
   // Extras state (empty by default)
   const [queues, setQueues] = useState([]);
@@ -295,48 +688,103 @@ function App() {
     }, 3400);
   };
 
-  // Initialize VK Bridge & Load saved state from localStorage / VK Storage
+  // Применение загруженных данных группы к состоянию
+  const applyLoadedGroupData = (data, keepUserId = '') => {
+    if (!data || !data.groupInfo) return;
+    const norm = normalizeGroupPayload(data);
+    // Запоминаем «синхронизированный» снимок, чтобы не отправлять обратно то, что только что получили
+    lastSyncedRef.current = JSON.stringify(norm);
+    setGroupInfo(norm.groupInfo);
+    setMembers(norm.members);
+    if (keepUserId) setCurrentUserId(keepUserId);
+    setSchedule(norm.schedule);
+    setHomeworks(norm.homeworks);
+    setQueues(norm.queues);
+    setFunds(norm.funds);
+    setBotBroadcasts(norm.botBroadcasts);
+    setDailyDeputyByDay(norm.dailyDeputyByDay);
+    setDailyAbsenceReasonByDay(norm.dailyAbsenceReasonByDay);
+    setDailyDeputyPermissions(norm.dailyDeputyPermissions);
+    setAttendance(norm.attendance);
+    setDeleteConfirmations(norm.deleteConfirmations);
+    setWeekAnchor(norm.weekAnchor);
+    setActiveWeekType(computeWeek(norm.weekAnchor).type);
+  };
+
+  // Запрос разрешения на отправку сообщений от имени бота ВК текущему участнику
+  const requestBotMessagesPermission = async (commId = botCommunityId) => {
+    const targetGroupId = Number(commId);
+    if (!targetGroupId || !window.vkBridge) return;
+    try {
+      await window.vkBridge.send('VKWebAppAllowMessagesFromGroup', {
+        group_id: targetGroupId,
+      });
+    } catch {
+      // User already allowed or closed modal
+    }
+  };
+
+  // Синхронизация текущей группы из облака ВК
+  const syncGroupFromCloudNow = async (silent = true) => {
+    if (!groupInfo?.code) return;
+    // Есть несохранённые локальные изменения — не затираем их данными из облака
+    if (dirtyRef.current) {
+      if (!silent) showToast('Идёт сохранение изменений, повторите через пару секунд.');
+      return;
+    }
+    const found = await fetchGroupByCode(groupInfo.code);
+    if (found && found.deleted) {
+      resetAllData('Группа была удалена по совместному подтверждению старосты и замстаросты.');
+      return;
+    }
+    if (found && found.data && found.data.groupInfo && found.source !== 'local') {
+      const stillInGroup = (found.data.members || []).some(
+        (m) => m.id === currentUserId
+      );
+      if (!stillInGroup && currentUserId) {
+        // Исключаем только после двух подряд проверок, чтобы не выкинуть человека из-за устаревшего чтения
+        missCountRef.current += 1;
+        if (missCountRef.current >= 2) {
+          missCountRef.current = 0;
+          resetAllData('Вы были исключены из учебной группы старостой.');
+        }
+        return;
+      }
+      missCountRef.current = 0;
+      const incoming = JSON.stringify(normalizeGroupPayload(found.data));
+      if (incoming !== lastSyncedRef.current) {
+        applyLoadedGroupData(found.data, currentUserId);
+      }
+      if (!silent) showToast('Данные группы синхронизированы!');
+    }
+  };
+
+  // Initialize VK Bridge, detect Bot Community, & Load saved session
   useEffect(() => {
-    // Load persisted state if exists
+    syncErrorHandler = (msg) => showToast(msg);
+    let savedCode = '';
+    let savedUserId = '';
+
     try {
       const savedRaw = localStorage.getItem(STORAGE_KEY);
       if (savedRaw) {
         const parsed = JSON.parse(savedRaw);
-        if (parsed.groupInfo) {
-          setGroupInfo(parsed.groupInfo);
-          setMembers(parsed.members || []);
-          setCurrentUserId(parsed.currentUserId || '');
-          setSchedule(parsed.schedule || []);
-          setHomeworks(parsed.homeworks || []);
-          setQueues(parsed.queues || []);
-          setFunds(parsed.funds || []);
-          setBotBroadcasts(parsed.botBroadcasts || []);
-          setDailyDeputyByDay(parsed.dailyDeputyByDay || EMPTY_DAILY_DEPUTY);
-          setDailyAbsenceReasonByDay(
-            parsed.dailyAbsenceReasonByDay || EMPTY_DAILY_REASON
-          );
-          setAttendance(parsed.attendance || {});
-          setVkBotToken(parsed.vkBotToken || '');
-          setVkChatPeerId(parsed.vkChatPeerId || '');
-          setDeleteConfirmations(
-            parsed.deleteConfirmations || { starosta: false, deputy: false }
-          );
+        if (parsed.groupInfo && parsed.currentUserId) {
+          savedCode = parsed.groupInfo.code;
+          savedUserId = parsed.currentUserId;
+          applyLoadedGroupData(parsed, parsed.currentUserId);
           setStudentGroupBindings(parsed.studentGroupBindings || {});
-          setCurrentAcademicWeekType(
-            parsed.currentAcademicWeekType || 'numerator'
-          );
-          setActiveWeekType(parsed.currentAcademicWeekType || 'numerator');
           setScreenMode('app');
         }
       }
     } catch {
-      // Ignore storage errors in sandboxed frames
+      // Ignore storage errors
     }
 
-    // Check URL hash for direct #join=CODE link
+    // Check URL hash for direct #join=CODE link (only if user is NOT already locked to a group)
     try {
       const hash = window.location.hash || '';
-      if (hash.includes('join=')) {
+      if (!savedCode && hash.includes('join=')) {
         const codeParam = hash.split('join=')[1]?.split('&')[0];
         if (codeParam) {
           setStudentJoinForm((prev) => ({
@@ -347,15 +795,36 @@ function App() {
         }
       }
     } catch {
-      // Ignore location hash errors
+      // Ignore
     }
 
-    // Initialize VK Bridge if running inside VK environment
-    const initVk = async () => {
+    const initVkAndBot = async () => {
+      // 1. Автоматическое определение сообщества бота по VK_BOT_TOKEN из корня файла
+      const grpRes = await callVkApi('groups.getById', {});
+      const commObj =
+        grpRes?.response?.groups?.[0] || grpRes?.response?.[0] || null;
+      if (commObj && commObj.id) {
+        setBotCommunityId(String(commObj.id));
+        setBotCommunityName(commObj.name || 'Бот группы');
+      }
+
+      // 2. Инициализация VK Bridge и получение профиля пользователя ВК
       const bridge = window.vkBridge;
+      const launchId = getLaunchVkUserId();
+      if (launchId) {
+        setCreateGroupForm((prev) => ({
+          ...prev,
+          starostaVkTag: prev.starostaVkTag || `@id${launchId}`,
+        }));
+        setStudentJoinForm((prev) => ({
+          ...prev,
+          studentVkTag: prev.studentVkTag || `@id${launchId}`,
+        }));
+      }
+
       if (bridge && typeof bridge.send === 'function') {
         try {
-          await bridge.send('VKWebAppInit');
+          // VKWebAppInit уже отправлен в <head> сразу после загрузки скрипта
           setVkBridgeReady(true);
           const userInfo = await bridge.send('VKWebAppGetUserInfo');
           if (userInfo && userInfo.first_name) {
@@ -377,17 +846,45 @@ function App() {
           // Running outside VK container
         }
       }
+
+      // 3. Если пользователь уже состоит в группе — подгружаем актуальный состав группы из облака ВК
+      if (savedCode) {
+        const latest = await fetchGroupByCode(savedCode);
+        if (latest && latest.data && latest.data.groupInfo) {
+          applyLoadedGroupData(latest.data, savedUserId);
+        }
+      }
     };
-    initVk();
+
+    initVkAndBot();
   }, []);
 
-  // Save state to localStorage + VK Storage whenever data changes
+  // Периодическая авто-синхронизация данных группы между устройствами (каждые 8 секунд)
   useEffect(() => {
-    if (!groupInfo) return;
-    const payload = {
+    if (!groupInfo?.code || screenMode !== 'app') return;
+    const timer = setInterval(() => {
+      syncGroupFromCloudNow(true);
+    }, 8000);
+    return () => clearInterval(timer);
+  }, [groupInfo?.code, screenMode, currentUserId]);
+
+  // Тема: переключаем класс dark на <html>, чтобы работали tailwind-классы dark:*
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', darkMode);
+  }, [darkMode]);
+
+  // Раз в минуту пересчитываем «текущую неделю» (смена недели в полночь)
+  useEffect(() => {
+    const t = setInterval(() => setNowTick(Date.now()), 60000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Сохранение состояния в локальное хранилище + (с задержкой) в облачный реестр группы
+  useEffect(() => {
+    if (!groupInfo || !groupInfo.code) return;
+    const groupPayload = normalizeGroupPayload({
       groupInfo,
       members,
-      currentUserId,
       schedule,
       homeworks,
       queues,
@@ -395,27 +892,41 @@ function App() {
       botBroadcasts,
       dailyDeputyByDay,
       dailyAbsenceReasonByDay,
+      dailyDeputyPermissions,
       attendance,
-      vkBotToken,
-      vkChatPeerId,
       deleteConfirmations,
-      studentGroupBindings,
-      currentAcademicWeekType,
-    };
+      weekAnchor,
+    });
     try {
-      const serialized = JSON.stringify(payload);
-      localStorage.setItem(STORAGE_KEY, serialized);
-      if (vkBridgeReady && window.vkBridge) {
-        window.vkBridge
-          .send('VKWebAppStorageSet', {
-            key: STORAGE_KEY,
-            value: serialized,
-          })
-          .catch(() => {});
-      }
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({
+          ...groupPayload,
+          updatedAt: Date.now(),
+          currentUserId,
+          studentGroupBindings,
+        })
+      );
     } catch {
-      // Ignore quota or sandbox storage restrictions
+      // Ignore
     }
+    const snapshot = JSON.stringify(groupPayload);
+    if (snapshot === lastSyncedRef.current) {
+      dirtyRef.current = false;
+      return;
+    }
+    dirtyRef.current = true;
+    const timer = setTimeout(async () => {
+      const ok = await saveGroupByCode(groupInfo.code, {
+        ...groupPayload,
+        updatedAt: Date.now(),
+      });
+      if (ok) {
+        lastSyncedRef.current = snapshot;
+        dirtyRef.current = false;
+      }
+    }, 1200);
+    return () => clearTimeout(timer);
   }, [
     groupInfo,
     members,
@@ -427,13 +938,11 @@ function App() {
     botBroadcasts,
     dailyDeputyByDay,
     dailyAbsenceReasonByDay,
+    dailyDeputyPermissions,
     attendance,
-    vkBotToken,
-    vkChatPeerId,
     deleteConfirmations,
     studentGroupBindings,
-    currentAcademicWeekType,
-    vkBridgeReady,
+    weekAnchor,
   ]);
 
   // Keep attendanceSelectedPairId synced when schedule gets first item
@@ -465,7 +974,7 @@ function App() {
       }
       showToast(label);
     } catch {
-      showToast(label);
+      showToast('Не удалось скопировать — выделите текст и скопируйте вручную.');
     }
   };
 
@@ -488,6 +997,10 @@ function App() {
   };
 
   const resetAllData = (customMsg = 'Группа успешно удалена.') => {
+    if (groupInfo?.code) {
+      removeLocalGroupFromRegistry(groupInfo.code);
+      saveGroupByCode(groupInfo.code, { deleted: true });
+    }
     try {
       localStorage.removeItem(STORAGE_KEY);
       if (vkBridgeReady && window.vkBridge) {
@@ -513,6 +1026,11 @@ function App() {
     setDailyAbsenceReasonByDay(EMPTY_DAILY_REASON);
     setAttendance({});
     setDeleteConfirmations({ starosta: false, deputy: false });
+    setDailyDeputyPermissions(DEFAULT_DAILY_PERMS);
+    setWeekAnchor(null);
+    lastSyncedRef.current = '';
+    dirtyRef.current = false;
+    missCountRef.current = 0;
     setStudentGroupBindings({});
     setSelectedStudentProfileId(null);
     setEntryRoleStep('choose');
@@ -549,7 +1067,7 @@ function App() {
         return;
       }
       setDeleteConfirmations((prev) => ({ ...prev, deputy: true }));
-      showToast('Замстаросты подтвердил(а) удаление (1/2). Группа удалится после подтверждения старосты.');
+      showToast('Замстароста подтвердил(а) удаление (1/2). Группа удалится после подтверждения старосты.');
     }
   };
 
@@ -561,7 +1079,7 @@ function App() {
       currentUser.id === memberId;
 
     if (!canView) {
-      showToast('Просматривать прогулы и личные данные студента могут только сам студент, староста и замстаросты.');
+      showToast('Просматривать прогулы и личные данные студента могут только сам студент, староста и замстароста.');
       return;
     }
     setSelectedStudentProfileId(memberId);
@@ -609,9 +1127,12 @@ function App() {
     if (selectedStudentProfileId === memberId) {
       setSelectedStudentProfileId(null);
     }
-    if (currentUserId === memberId) {
-      setCurrentUserId('u1');
-    }
+    setHomeworks((prev) =>
+      prev.map((h) => ({
+        ...h,
+        completedBy: (h.completedBy || []).filter((id) => id !== memberId),
+      }))
+    );
     showToast(
       target.role === 'deputy'
         ? `Заместитель старосты ${target.name} удален(а) из группы.`
@@ -642,7 +1163,18 @@ function App() {
           };
         }
         if (m.role === 'deputy') {
-          return { ...m, role: 'member' };
+          return {
+            ...m,
+            role: 'member',
+            avatarColor: 'bg-emerald-600',
+            permissions: {
+              canManageHomework: false,
+              canMarkAttendance: false,
+              canEditSchedule: false,
+              canManageQueues: false,
+              canPostAnnouncements: false,
+            },
+          };
         }
         return m;
       })
@@ -678,8 +1210,7 @@ function App() {
 
   const currentUser = useMemo(
     () =>
-      members.find((m) => m.id === currentUserId) ||
-      members[0] || {
+      members.find((m) => m.id === currentUserId) || {
         id: 'guest',
         name: 'Пользователь',
         vkTag: '',
@@ -707,8 +1238,9 @@ function App() {
     [members, appointedDailyUserId]
   );
 
+  const appointedTodayUserId = dailyDeputyByDay[todayDayId()] || null;
   const isDailyDeputyToday =
-    appointedDailyUserId !== null && appointedDailyUserId === currentUser.id;
+    appointedTodayUserId !== null && appointedTodayUserId === currentUser.id;
 
   // Effective permissions for current user
   const effectivePermissions = useMemo(() => {
@@ -760,23 +1292,41 @@ function App() {
   const nextAcademicWeekType =
     currentAcademicWeekType === 'numerator' ? 'denominator' : 'numerator';
 
+  // К какой неделе относится ДЗ: считается от календаря, поэтому после смены недели задания «переезжают» сами,
+  // а задания прошедших недель скрываются.
+  const hwScopeOf = (hw) => {
+    if (hw.dueWeek === undefined) return hw.targetWeekScope || 'current';
+    if (hw.dueWeek === currentWeekCounter) return 'current';
+    if (hw.dueWeek === currentWeekCounter + 1) return 'next';
+    return hw.dueWeek < currentWeekCounter ? 'past' : 'future';
+  };
+
+  const chooseHwScope = (scope) => {
+    const wt = scope === 'next' ? nextAcademicWeekType : currentAcademicWeekType;
+    setHwModal((prev) => {
+      const cur = schedule.find((x) => x.id === prev.scheduleId);
+      const pick = cur && cur.weekType === wt ? cur : schedule.find((x) => x.weekType === wt);
+      return { ...prev, targetWeekScope: scope, scheduleId: pick ? pick.id : '' };
+    });
+  };
+
   // Formatted invite text with group code & link
   const formattedInviteText = useMemo(() => {
     if (!groupInfo) return '';
     return `🎓 Присоединяйтесь к учебной группе «${groupInfo.name}» (${groupInfo.university}, ${groupInfo.course}) в мини-приложении Староста.ВК!\n\n🔑 Идентификатор (код) группы: ${groupInfo.code}\n🔗 Ссылка для вступления: ${groupInfo.inviteLink}\n\nВ приложении доступно расписание (числитель/знаменатель), домашние задания на каждую пару и план на следующую неделю.`;
   }, [groupInfo]);
 
-  // Handle Starosta Group Creation (Clean start, only creates the Starosta & Deputy entered)
-  const handleCreateGroupByStarosta = (e) => {
+  // Создание группы (без обязательного ввода старосты и замстаросты в начале — они добавляются/назначаются позже)
+  const handleCreateGroupByStarosta = async (e) => {
     e.preventDefault();
     const grpName = createGroupForm.groupName.trim();
-    const starostaName = createGroupForm.starostaName.trim();
-    const deputyName = createGroupForm.deputyName.trim();
 
-    if (!grpName || !starostaName || !deputyName) {
-      showToast('Заполните название группы, ФИО старосты и ФИО заместителя');
+    if (!grpName) {
+      showToast('Введите название учебной группы!');
       return;
     }
+
+    await requestBotMessagesPermission();
 
     const uniName =
       createGroupForm.university === 'custom'
@@ -792,11 +1342,23 @@ function App() {
     const generatedCode = `VK-${cleanSlug}-${randomDigits}`;
     const generatedLink = `https://vk.com/app${vkAppId}#join=${generatedCode}`;
 
+    const myVkId = vkUser?.id ? String(vkUser.id) : getLaunchVkUserId();
+    const autoVkName = vkUser
+      ? `${vkUser.first_name} ${vkUser.last_name || ''}`.trim()
+      : '';
+    const initialStarostaName =
+      createGroupForm.starostaName.trim() || autoVkName || 'Староста группы';
+    const initialStarostaTag =
+      createGroupForm.starostaVkTag.trim() ||
+      (myVkId ? `@id${myVkId}` : '@starosta');
+
     const initialMembersList = [
       {
         id: 'u1',
-        name: starostaName,
-        vkTag: createGroupForm.starostaVkTag.trim() || '@starosta',
+        vkId: myVkId,
+        groupCode: generatedCode,
+        name: initialStarostaName,
+        vkTag: initialStarostaTag,
         subgroup: 1,
         role: 'starosta',
         avatarColor: 'bg-blue-600',
@@ -808,32 +1370,36 @@ function App() {
           canPostAnnouncements: true,
         },
       },
-      {
-        id: 'u2',
-        name: deputyName,
-        vkTag: createGroupForm.deputyVkTag.trim() || '@deputy',
-        subgroup: 1,
-        role: 'deputy',
-        avatarColor: 'bg-purple-600',
-        permissions: {
-          canManageHomework: true,
-          canMarkAttendance: true,
-          canEditSchedule: true,
-          canManageQueues: true,
-          canPostAnnouncements: true,
-        },
-      },
     ];
 
-    setGroupInfo({
+    const newGroupInfo = {
       name: grpName,
       university: uniName,
       faculty: createGroupForm.faculty.trim() || 'Факультет не указан',
       course: createGroupForm.course,
       code: generatedCode,
       inviteLink: generatedLink,
-    });
+    };
 
+    const initialAnchor = makeAnchor(createGroupForm.initialWeekType);
+    const initialGroupPayload = {
+      groupInfo: newGroupInfo,
+      members: initialMembersList,
+      schedule: [],
+      homeworks: [],
+      queues: [],
+      funds: [],
+      botBroadcasts: [],
+      dailyDeputyByDay: EMPTY_DAILY_DEPUTY,
+      dailyAbsenceReasonByDay: EMPTY_DAILY_REASON,
+      attendance: {},
+      deleteConfirmations: { starosta: false, deputy: false },
+      dailyDeputyPermissions: DEFAULT_DAILY_PERMS,
+      weekAnchor: initialAnchor,
+      updatedAt: Date.now(),
+    };
+
+    setGroupInfo(newGroupInfo);
     setMembers(initialMembersList);
     setCurrentUserId('u1');
     setSchedule([]);
@@ -844,15 +1410,22 @@ function App() {
     setDailyDeputyByDay(EMPTY_DAILY_DEPUTY);
     setDailyAbsenceReasonByDay(EMPTY_DAILY_REASON);
     setAttendance({});
-    setCurrentAcademicWeekType(createGroupForm.initialWeekType);
+    setDeleteConfirmations({ starosta: false, deputy: false });
+    setWeekAnchor(initialAnchor);
     setActiveWeekType(createGroupForm.initialWeekType);
+
+    lastSyncedRef.current = JSON.stringify(normalizeGroupPayload(initialGroupPayload));
+    const savedOk = await saveGroupByCode(generatedCode, initialGroupPayload, myVkId);
+    if (!savedOk) {
+      lastSyncedRef.current = ''; // повторим сохранение автоматически
+    }
 
     setEntryRoleStep('starosta_created_code');
     showToast(`Группа «${grpName}» создана! Код: ${generatedCode}`);
   };
 
-  // Handle Student Join by Group ID
-  const handleStudentJoinGroup = (e) => {
+  // Вход студента в существующую группу по коду (добавляет студента в общую группу к старосте, НЕ создавая новую группу)
+  const handleStudentJoinGroup = async (e) => {
     e.preventDefault();
     const cleanEntered = studentJoinForm.enteredCode.trim().toUpperCase();
     const studentName = studentJoinForm.studentName.trim();
@@ -873,13 +1446,17 @@ function App() {
       return;
     }
 
+    const myVkId = vkUser?.id ? String(vkUser.id) : getLaunchVkUserId();
     const normName = studentName.toLowerCase();
-    const normTag = studentJoinForm.studentVkTag.trim().toLowerCase();
+    const rawTag =
+      studentJoinForm.studentVkTag.trim() || (myVkId ? `@id${myVkId}` : '@vk_student');
+    const normTag = rawTag.toLowerCase();
+
     const existingBoundCode =
       studentGroupBindings[normName] ||
-      (normTag ? studentGroupBindings[normTag] : null);
+      (normTag ? studentGroupBindings[normTag] : null) ||
+      (myVkId ? studentGroupBindings[myVkId] : null);
 
-    // Check if student is already bound to another group
     if (existingBoundCode && existingBoundCode.toUpperCase() !== cleanEntered) {
       setStudentJoinForm((prev) => ({
         ...prev,
@@ -888,56 +1465,77 @@ function App() {
       return;
     }
 
-    // Also if current device already has an active group where this user is registered, block joining a second group code
     if (groupInfo && cleanEntered !== groupInfo.code.toUpperCase()) {
-      const isAlreadyMemberHere = members.some(
-        (m) =>
-          m.name.trim().toLowerCase() === normName ||
-          (normTag && m.vkTag.trim().toLowerCase() === normTag) ||
-          m.role === 'member'
-      );
-      if (isAlreadyMemberHere) {
-        setStudentJoinForm((prev) => ({
-          ...prev,
-          error: `Вы уже состоите в группе «${groupInfo.name}» (${groupInfo.code}). Вступить во вторую группу нельзя, пока староста не исключит вас из текущей.`,
-        }));
-        return;
-      }
       setStudentJoinForm((prev) => ({
         ...prev,
-        error: `Группа с кодом «${cleanEntered}» недоступна, так как вы уже привязаны к группе «${groupInfo.name}» (${groupInfo.code}).`,
+        error: `Вы уже состоите в группе «${groupInfo.name}» (${groupInfo.code}). Вступить во вторую группу нельзя, пока староста не исключит вас из текущей.`,
       }));
       return;
     }
 
-    // If student joins via code before groupInfo was initialized locally, initialize group container from code
-    if (!groupInfo) {
-      const codeParts = cleanEntered.split('-');
-      const inferredName = codeParts[1] || cleanEntered;
-      setGroupInfo({
-        name: inferredName,
-        university: 'Подключенная группа ВК',
-        faculty: '',
-        course: '',
-        code: cleanEntered,
-        inviteLink: `https://vk.com/app${vkAppId}#join=${cleanEntered}`,
-      });
+    await requestBotMessagesPermission();
+
+    // Ищем существующую группу, созданную старостой, в облаке ВК и реестре
+    const found = await fetchGroupByCode(cleanEntered);
+    if (!found || !found.data || !found.data.groupInfo) {
+      setStudentJoinForm((prev) => ({
+        ...prev,
+        error: `Группа с кодом «${cleanEntered}» не найдена. Проверьте правильность кода у старосты.`,
+      }));
+      return;
     }
 
-    // Check if student with same name already exists in members (e.g. Deputy added by Starosta)
-    const existingMember = members.find(
-      (m) => m.name.toLowerCase() === studentName.toLowerCase()
+    const targetGroup = found.data;
+    const currentMembers = targetGroup.members || [];
+
+    // Проверяем, есть ли уже этот участник в списке группы (по VK ID, тегу или имени)
+    // Участника узнаём ТОЛЬКО по VK ID. По имени/тегу можно «забрать» лишь карточку,
+    // добавленную вручную старостой (без VK ID) и без особых ролей — иначе можно выдать себя за старосту.
+    const existingMember = currentMembers.find(
+      (m) =>
+        (myVkId && m.vkId && String(m.vkId) === String(myVkId)) ||
+        (!m.vkId &&
+          m.role === 'member' &&
+          (m.name.trim().toLowerCase() === normName ||
+            (normTag && m.vkTag && m.vkTag.trim().toLowerCase() === normTag)))
     );
 
+    if (
+      !existingMember &&
+      currentMembers.some((m) => m.name.trim().toLowerCase() === normName)
+    ) {
+      setStudentJoinForm((prev) => ({
+        ...prev,
+        error:
+          'Участник с таким именем уже есть в группе. Добавьте к имени отчество или инициал, либо попросите старосту удалить дубль.',
+      }));
+      return;
+    }
+
+    let activeMemberId = '';
+    let updatedMembers = currentMembers;
+
     if (existingMember) {
-      setCurrentUserId(existingMember.id);
-      showToast(`Добро пожаловать в группу, ${existingMember.name}!`);
+      activeMemberId = existingMember.id;
+      updatedMembers = currentMembers.map((m) =>
+        m.id === existingMember.id
+          ? {
+              ...m,
+              vkId: myVkId || m.vkId || '',
+              vkTag: rawTag || m.vkTag,
+              groupCode: targetGroup.groupInfo.code,
+            }
+          : m
+      );
+      showToast(`Добро пожаловать в группу «${targetGroup.groupInfo.name}», ${existingMember.name}!`);
     } else {
-      const newId = 'u_' + Date.now();
+      activeMemberId = myVkId ? `u_${myVkId}` : 'u_' + Date.now();
       const newStudent = {
-        id: newId,
+        id: activeMemberId,
+        vkId: myVkId,
+        groupCode: targetGroup.groupInfo.code,
         name: studentName,
-        vkTag: studentJoinForm.studentVkTag.trim() || '@vk_student',
+        vkTag: rawTag,
         subgroup: Number(studentJoinForm.subgroup) || 1,
         role: 'member',
         avatarColor: 'bg-emerald-600',
@@ -949,22 +1547,33 @@ function App() {
           canPostAnnouncements: false,
         },
       };
-      setMembers((prev) => [...prev, newStudent]);
-      setCurrentUserId(newId);
-      showToast(`Вы успешно вступили в группу по коду ${cleanEntered}!`);
+      updatedMembers = [...currentMembers, newStudent];
+      showToast(`Вы добавлены в группу «${targetGroup.groupInfo.name}»!`);
     }
+
+    const updatedGroupPayload = {
+      ...targetGroup,
+      members: updatedMembers,
+      updatedAt: Date.now(),
+    };
+
+    applyLoadedGroupData(updatedGroupPayload, activeMemberId);
 
     setStudentGroupBindings((prev) => ({
       ...prev,
-      [normName]: groupInfo ? groupInfo.code : cleanEntered,
-      ...(normTag ? { [normTag]: groupInfo ? groupInfo.code : cleanEntered } : {}),
+      [normName]: targetGroup.groupInfo.code,
+      ...(normTag ? { [normTag]: targetGroup.groupInfo.code } : {}),
+      ...(myVkId ? { [myVkId]: targetGroup.groupInfo.code } : {}),
     }));
+
+    await saveGroupByCode(targetGroup.groupInfo.code, updatedGroupPayload, myVkId);
+
     setStudentJoinForm((prev) => ({ ...prev, error: '' }));
     setScreenMode('app');
   };
 
-  // Handle Bot Broadcast Message
-  const handleSendBotBroadcast = (e) => {
+  // Отправка важного сообщения от имени единого бота ВК строго участникам ТЕКУЩЕЙ учебной группы
+  const handleSendBotBroadcast = async (e) => {
     e.preventDefault();
     if (!effectivePermissions.canSendBotBroadcast) {
       showToast(
@@ -977,14 +1586,31 @@ function App() {
       return;
     }
 
+    if (broadcastInput.text.length > 3000) {
+      showToast('Сообщение слишком длинное (максимум 3000 символов).');
+      return;
+    }
+
     const now = new Date();
     const timeStr = now.toLocaleTimeString('ru-RU', {
       hour: '2-digit',
       minute: '2-digit',
     });
 
+    // Подгружаем самый свежий список участников этой группы перед отправкой
+    let currentGroupMembers = members;
+    if (groupInfo?.code) {
+      const latest = await fetchGroupByCode(groupInfo.code);
+      if (latest?.data?.members?.length > 0) {
+        currentGroupMembers = latest.data.members;
+        setMembers(currentGroupMembers);
+      }
+    }
+
     const newBroadcast = {
       id: 'b_' + Date.now(),
+      groupCode: groupInfo?.code || '',
+      groupName: groupInfo?.name || '',
       title:
         broadcastInput.title.trim() ||
         'Важное сообщение для всех участников группы',
@@ -996,55 +1622,63 @@ function App() {
           : 'Заместитель старосты',
       time: `Сегодня, ${timeStr}`,
       urgent: broadcastInput.urgent,
-      deliveredCount: members.length,
+      deliveredCount: 0,
+      totalCount: 0,
     };
 
     setBotBroadcasts((prev) => [newBroadcast, ...prev]);
     setBroadcastInput({ title: '', text: '', urgent: true });
 
-    // Send via VK Bot API (JSONP) if community token is configured
-    const cleanToken = vkBotToken.trim();
-    if (cleanToken) {
-      const formattedVkText = `${newBroadcast.urgent ? '⚡ [ВАЖНО] ' : '📌 '}${newBroadcast.title}\n\n${newBroadcast.text}\n\n👤 Отправитель: ${newBroadcast.senderName} (${newBroadcast.senderRoleLabel})`;
-      const targets = new Set();
-      if (vkChatPeerId.trim()) {
-        const cleanPeer = vkChatPeerId.trim().replace(/\D/g, '');
-        if (cleanPeer) targets.add(cleanPeer);
+    // Отправка через единый VK_BOT_TOKEN (указанный в корне файла на GitHub)
+    // Бот понимает, в какой именно группе находится отправитель (groupInfo.code),
+    // и отправляет сообщения ТОЛЬКО участникам этой группы!
+    const formattedVkText = `🎓 Группа «${groupInfo?.name || ''}» (${groupInfo?.university || ''})\n${
+      newBroadcast.urgent ? '⚡ [ВАЖНО] ' : '📌 '
+    }${newBroadcast.title}\n\n${newBroadcast.text}\n\n👤 Отправитель: ${
+      newBroadcast.senderName
+    } (${newBroadcast.senderRoleLabel})`;
+
+    const targetPeerIds = new Set();
+    currentGroupMembers.forEach((m) => {
+      if (m.groupCode && groupInfo?.code && m.groupCode !== groupInfo.code) {
+        return;
       }
-      members.forEach((m) => {
+      if (m.vkId && /^\d+$/.test(String(m.vkId))) {
+        targetPeerIds.add(String(m.vkId));
+      } else {
         const rawTag = String(m.vkTag || '');
         const matchId = rawTag.match(/(\d{5,15})/);
         if (matchId && matchId[1]) {
-          targets.add(matchId[1]);
+          targetPeerIds.add(matchId[1]);
         }
-      });
+      }
+    });
 
-      targets.forEach((peerId) => {
-        try {
-          const cbName = 'vkBotCb_' + Date.now() + '_' + Math.floor(Math.random() * 10000);
-          const script = document.createElement('script');
-          window[cbName] = () => {
-            delete window[cbName];
-            if (script.parentNode) script.parentNode.removeChild(script);
-          };
-          const params = new URLSearchParams({
-            peer_id: String(peerId),
-            random_id: String(Math.floor(Math.random() * 1e9)),
-            message: formattedVkText,
-            access_token: cleanToken,
-            v: '5.199',
-            callback: cbName,
-          });
-          script.src = `https://api.vk.com/method/messages.send?${params.toString()}`;
-          document.body.appendChild(script);
-        } catch {
-          // Ignore network error per recipient
-        }
+    const peerList = [...targetPeerIds];
+    let delivered = 0;
+    for (let i = 0; i < peerList.length; i += 100) {
+      const chunk = peerList.slice(i, i + 100);
+      const res = await callVkApi('messages.send', {
+        peer_ids: chunk.join(','),
+        random_id: String(Math.floor(Math.random() * 1e9)),
+        message: formattedVkText,
       });
+      if (Array.isArray(res?.response)) {
+        delivered += res.response.filter((x) => !x.error).length;
+      }
     }
 
+    setBotBroadcasts((prev) =>
+      prev.map((b) =>
+        b.id === newBroadcast.id
+          ? { ...b, deliveredCount: delivered, totalCount: peerList.length }
+          : b
+      )
+    );
     showToast(
-      `🤖 Сообщение отправлено от имени бота всем участникам группы (${members.length}/${members.length} чел.)!`
+      delivered === peerList.length
+        ? `🤖 Сообщение доставлено ${delivered} из ${peerList.length} чел.`
+        : `🤖 Доставлено ${delivered} из ${peerList.length}. Остальные не разрешили сообщения от бота — пусть откроют приложение и нажмут «Разрешить».`
     );
   };
 
@@ -1052,7 +1686,8 @@ function App() {
   const getHomeworksForPair = (scheduleId, scopeFilter = null) => {
     return homeworks.filter((hw) => {
       if (hw.scheduleId !== scheduleId) return false;
-      if (scopeFilter && hw.targetWeekScope !== scopeFilter) return false;
+      if (scopeFilter && hwScopeOf(hw) !== scopeFilter) return false;
+      if (!scopeFilter && hwScopeOf(hw) === 'past') return false;
       return true;
     });
   };
@@ -1069,8 +1704,7 @@ function App() {
       return;
     }
     const inferredScope =
-      defaultScope ||
-      (pair.weekType === nextAcademicWeekType ? 'next' : 'current');
+      pair.weekType === nextAcademicWeekType ? 'next' : 'current';
     setHwModal({
       open: true,
       mode: 'add',
@@ -1093,7 +1727,7 @@ function App() {
       open: true,
       mode: 'edit',
       scheduleId: hw.scheduleId,
-      targetWeekScope: hw.targetWeekScope,
+      targetWeekScope: hwScopeOf(hw) === 'next' ? 'next' : 'current',
       hwId: hw.id,
       title: hw.title,
       description: hw.description,
@@ -1121,6 +1755,7 @@ function App() {
         id: 'hw_' + Date.now(),
         scheduleId: hwModal.scheduleId,
         targetWeekScope: hwModal.targetWeekScope,
+        dueWeek: currentWeekCounter + (hwModal.targetWeekScope === 'next' ? 1 : 0),
         title: hwModal.title.trim(),
         description: hwModal.description.trim(),
         attachment: hwModal.attachment.trim(),
@@ -1139,6 +1774,7 @@ function App() {
                 ...item,
                 scheduleId: hwModal.scheduleId,
                 targetWeekScope: hwModal.targetWeekScope,
+        dueWeek: currentWeekCounter + (hwModal.targetWeekScope === 'next' ? 1 : 0),
                 title: hwModal.title.trim(),
                 description: hwModal.description.trim(),
                 attachment: hwModal.attachment.trim(),
@@ -1294,7 +1930,7 @@ function App() {
     }
     setAttendance((prev) => ({
       ...prev,
-      [`${scheduleId}_${studentId}`]: status,
+      [`${attendanceDate}|${scheduleId}|${studentId}`]: status,
     }));
   };
 
@@ -1309,7 +1945,7 @@ function App() {
     }
     const next = { ...attendance };
     members.forEach((m) => {
-      next[`${scheduleId}_${m.id}`] = 'present';
+      next[`${attendanceDate}|${scheduleId}|${m.id}`] = 'present';
     });
     setAttendance(next);
     showToast('Все участники отмечены как присутствующие');
@@ -1337,7 +1973,7 @@ function App() {
 
       const pairsWithHw = pairsOnDay.map((pair) => {
         const pairHws = homeworks.filter(
-          (hw) => hw.scheduleId === pair.id && hw.targetWeekScope === 'next'
+          (hw) => hw.scheduleId === pair.id && hwScopeOf(hw) === 'next'
         );
         return { pair, pairHws };
       });
@@ -1353,7 +1989,7 @@ function App() {
         totalHwsOnDay,
       };
     });
-  }, [schedule, homeworks, nextAcademicWeekType]);
+  }, [schedule, homeworks, nextAcademicWeekType, currentWeekCounter]);
 
   // Homework Managers list
   const homeworkManagers = useMemo(() => {
@@ -1678,52 +2314,7 @@ function App() {
                   />
                 </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block font-semibold mb-1">
-                      ФИО Старосты (закрепляется постоянно) *:
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={createGroupForm.starostaName}
-                      onChange={(e) =>
-                        setCreateGroupForm({
-                          ...createGroupForm,
-                          starostaName: e.target.value,
-                        })
-                      }
-                      placeholder="Ваше Имя и Фамилия"
-                      className={`w-full px-3.5 py-2.5 rounded-xl border ${
-                        darkMode
-                          ? 'bg-slate-800 border-slate-700'
-                          : 'bg-slate-50 border-slate-200'
-                      }`}
-                    />
-                  </div>
-                  <div>
-                    <label className="block font-semibold mb-1">
-                      ФИО Заместителя старосты (постоянный) *:
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={createGroupForm.deputyName}
-                      onChange={(e) =>
-                        setCreateGroupForm({
-                          ...createGroupForm,
-                          deputyName: e.target.value,
-                        })
-                      }
-                      placeholder="Имя и Фамилия заместителя"
-                      className={`w-full px-3.5 py-2.5 rounded-xl border ${
-                        darkMode
-                          ? 'bg-slate-800 border-slate-700'
-                          : 'bg-slate-50 border-slate-200'
-                      }`}
-                    />
-                  </div>
-                </div>
+
 
                 <div>
                   <label className="block font-semibold mb-1">
@@ -1852,25 +2443,12 @@ function App() {
                 </pre>
               </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
-                <button
-                  onClick={() => {
-                    setStudentJoinForm((prev) => ({
-                      ...prev,
-                      enteredCode: groupInfo.code,
-                    }));
-                    setEntryRoleStep('student_join');
-                  }}
-                  className="px-4 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 text-xs font-semibold hover:bg-slate-500/10"
-                >
-                  Войти как Студент по этому коду
-                </button>
-
+              <div className="flex items-center justify-end gap-3 pt-2">
                 <button
                   onClick={() => setScreenMode('app')}
-                  className="px-5 py-2.5 rounded-xl bg-[#2688EB] hover:bg-blue-600 text-white text-xs sm:text-sm font-bold flex items-center gap-2 shadow-sm"
+                  className="w-full sm:w-auto justify-center px-5 py-2.5 rounded-xl bg-[#2688EB] hover:bg-blue-600 text-white text-xs sm:text-sm font-bold flex items-center gap-2 shadow-sm"
                 >
-                  Перейти к заполнению расписания <ArrowRight className="w-4 h-4" />
+                  Перейти в управление группой <ArrowRight className="w-4 h-4" />
                 </button>
               </div>
             </div>
@@ -2087,72 +2665,41 @@ function App() {
             </div>
           </div>
 
-          {/* Interactive Role Switcher, VK Deploy Button, Entry Screen Button & Theme */}
+          {/* Locked User Role Badge, Sync Button & Theme */}
           <div className="flex items-center gap-2 flex-wrap">
-
-
             <button
-              onClick={() => {
-                setEntryRoleStep('choose');
-                setScreenMode('entry');
-              }}
+              type="button"
+              onClick={() => syncGroupFromCloudNow(false)}
               className={`px-2.5 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition ${
                 darkMode
                   ? 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700'
                   : 'bg-slate-100 border-slate-200 text-slate-700 hover:bg-slate-200'
               }`}
-              title="Вернуться на стартовый экран выбора роли (Староста / Студент)"
+              title="Обновить список участников и расписание"
             >
-              <LogOut className="w-3.5 h-3.5 text-[#2688EB]" />
-              <span>Сменить роль</span>
+              <RefreshCw className="w-3.5 h-3.5 text-[#2688EB]" />
+              <span>Обновить</span>
             </button>
 
-            {members.length > 0 && (
-              <div
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs ${
-                  darkMode
-                    ? 'bg-slate-800 border-slate-700'
-                    : 'bg-slate-100 border-slate-200'
-                }`}
-              >
-                <Eye className="w-3.5 h-3.5 text-[#2688EB]" />
-                <select
-                  value={currentUserId}
-                  onChange={(e) => {
-                    setCurrentUserId(e.target.value);
-                    const chosen = members.find((m) => m.id === e.target.value);
-                    if (chosen) {
-                      showToast(`Активный профиль: ${chosen.name}`);
-                    }
-                  }}
-                  className="bg-transparent font-semibold focus:outline-none cursor-pointer"
-                >
-                  {members.map((m) => (
-                    <option
-                      key={m.id}
-                      value={m.id}
-                      className={
-                        darkMode
-                          ? 'bg-slate-900 text-white'
-                          : 'bg-white text-slate-900'
-                      }
-                    >
-                      {m.name} (
-                      {m.role === 'starosta'
-                        ? 'Староста — пост.'
-                        : m.role === 'deputy'
-                        ? 'Замстаросты — пост.'
-                        : dailyDeputyByDay[selectedDay] === m.id
-                        ? 'Назначен на день'
-                        : m.permissions?.canManageHomework
-                        ? 'Редактор ДЗ'
-                        : 'Студент'}
-                      )
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
+            <div
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-semibold ${
+                darkMode
+                  ? 'bg-slate-800 border-slate-700 text-slate-200'
+                  : 'bg-slate-100 border-slate-200 text-slate-800'
+              }`}
+            >
+              <Shield className="w-3.5 h-3.5 text-[#2688EB]" />
+              <span>
+                {currentUser.name} •{' '}
+                {currentUser.role === 'starosta'
+                  ? 'Староста'
+                  : currentUser.role === 'deputy'
+                  ? 'Замстароста'
+                  : dailyDeputyByDay[selectedDay] === currentUser.id
+                  ? 'Зам на день'
+                  : 'Студент'}
+              </span>
+            </div>
 
             <button
               onClick={() => setDarkMode(!darkMode)}
@@ -2181,7 +2728,7 @@ function App() {
               id: 'homework',
               label: 'Что делать на след. неделю',
               icon: BookOpen,
-              badge: homeworks.filter((h) => h.targetWeekScope === 'next')
+              badge: homeworks.filter((h) => hwScopeOf(h) === 'next')
                 .length,
             },
             { id: 'roles', label: 'Роли, Замы и Доступ к ДЗ', icon: Shield },
@@ -2351,21 +2898,32 @@ function App() {
                   </span>
                   <button
                     onClick={() => {
+                      if (!effectivePermissions.canEditSchedule) {
+                        showToast('Исправлять тип недели могут только староста и замстароста.');
+                        return;
+                      }
                       const next =
                         currentAcademicWeekType === 'numerator'
                           ? 'denominator'
                           : 'numerator';
-                      setCurrentAcademicWeekType(next);
+                      setWeekAnchor((a) => ({
+                        ...(a || makeAnchor('numerator')),
+                        type:
+                          (a || makeAnchor('numerator')).type === 'numerator'
+                            ? 'denominator'
+                            : 'numerator',
+                      }));
                       setActiveWeekType(next);
                       showToast(
-                        `Текущая неделя переключена на: ${
+                        `Тип текущей недели исправлен на: ${
                           next === 'numerator' ? 'Числитель' : 'Знаменатель'
                         }`
                       );
                     }}
+                    title="Недели чередуются автоматически по календарю. Кнопка нужна, только если тип определён неверно."
                     className="text-xs px-2.5 py-1 rounded-lg bg-[#2688EB]/10 text-[#2688EB] hover:bg-[#2688EB]/20 font-medium transition"
                   >
-                    Сменить неделю
+                    Исправить тип недели      Сменить неделю
                   </button>
                 </div>
                 <div className="text-lg font-bold">
@@ -2379,7 +2937,7 @@ function App() {
                     darkMode ? 'text-slate-400' : 'text-slate-500'
                   }`}
                 >
-                  Следующая неделя автоматически считается как{' '}
+                  Недели чередуются автоматически по календарю. Следующая неделя —{' '}
                   <strong>
                     {nextAcademicWeekType === 'numerator'
                       ? 'Числитель'
@@ -2416,7 +2974,7 @@ function App() {
                     Староста: <strong>{permanentStarostaMember.name}</strong>
                   </div>
                   <div>
-                    Замстаросты: <strong>{permanentDeputyMember.name}</strong>
+                    Замстароста: <strong>{permanentDeputyMember.name}</strong>
                   </div>
                   <div className="pt-1 text-slate-500">
                     {dailyDeputyMember ? (
@@ -2456,7 +3014,7 @@ function App() {
                   </button>
                 </div>
                 <div className="text-lg font-bold">
-                  {homeworks.filter((h) => h.targetWeekScope === 'next').length}{' '}
+                  {homeworks.filter((h) => hwScopeOf(h) === 'next').length}{' '}
                   заданий на след. неделю
                 </div>
                 <p
@@ -2489,7 +3047,7 @@ function App() {
                           Важные сообщения (Рассылка от имени бота ВК)
                         </h2>
                         <span className="text-[11px] font-bold px-2 py-0.5 rounded-full bg-[#2688EB]/15 text-[#2688EB]">
-                          Видно только старосте и замстаросты • Получателей: {members.length} чел.
+                          Видно только старосте и замстаросте • Получателей: {members.length} чел.
                         </span>
                       </div>
                       <p className="text-xs text-slate-500">
@@ -2498,72 +3056,14 @@ function App() {
                     </div>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => setBotSettingsOpen(!botSettingsOpen)}
-                    className={`px-3 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition ${
-                      vkBotToken.trim()
-                        ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                        : darkMode
-                        ? 'border-slate-700 bg-slate-800 text-slate-300'
-                        : 'border-slate-200 bg-white text-slate-700'
-                    }`}
-                  >
+                  <span className="px-3 py-1.5 rounded-xl bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-xs font-bold flex items-center gap-1.5">
                     <Bot className="w-3.5 h-3.5" />
-                    <span>{vkBotToken.trim() ? 'Бот ВК подключен' : 'Настроить токен бота ВК'}</span>
-                  </button>
+                    <span>
+                      Группа: {groupInfo?.name} ({groupInfo?.code})
+                      {botCommunityName ? ` • ${botCommunityName}` : ''}
+                    </span>
+                  </span>
                 </div>
-
-                {botSettingsOpen && (
-                  <div
-                    className={`mb-4 p-3.5 rounded-xl border space-y-2.5 text-xs ${
-                      darkMode
-                        ? 'bg-slate-800/90 border-slate-700'
-                        : 'bg-white border-blue-200'
-                    }`}
-                  >
-                    <div className="font-bold text-[#2688EB]">
-                      Подключение бота сообщества ВКонтакте для авто-рассылки
-                    </div>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                      <div>
-                        <label className="block font-semibold mb-1 text-slate-500">
-                          Ключ доступа сообщества ВК (Токен бота):
-                        </label>
-                        <input
-                          type="password"
-                          value={vkBotToken}
-                          onChange={(e) => setVkBotToken(e.target.value)}
-                          placeholder="vk1.a.Ваш_токен_сообщества..."
-                          className={`w-full px-3 py-2 rounded-lg border ${
-                            darkMode
-                              ? 'bg-slate-900 border-slate-700'
-                              : 'bg-slate-50 border-slate-200'
-                          }`}
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-semibold mb-1 text-slate-500">
-                          Peer ID беседы группы (необязательно, например 2000000001):
-                        </label>
-                        <input
-                          type="text"
-                          value={vkChatPeerId}
-                          onChange={(e) => setVkChatPeerId(e.target.value)}
-                          placeholder="2000000001 или ID диалога"
-                          className={`w-full px-3 py-2 rounded-lg border ${
-                            darkMode
-                              ? 'bg-slate-900 border-slate-700'
-                              : 'bg-slate-50 border-slate-200'
-                          }`}
-                        />
-                      </div>
-                    </div>
-                    <p className="text-[11px] text-slate-400">
-                      Токен создается в настройках вашего сообщества ВК: «Управление» → «Работа с API» → «Ключи доступа» (с правом доступа к сообщениям сообщества).
-                    </p>
-                  </div>
-                )}
 
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
                   {/* Left: Send form */}
@@ -2581,7 +3081,7 @@ function App() {
                           <Send className="w-3.5 h-3.5" /> Отправить сообщение от имени бота
                         </span>
                         <span className="text-[11px] text-slate-400">
-                          {currentUser.role === 'starosta' ? 'Староста' : 'Замстаросты'}
+                          {currentUser.role === 'starosta' ? 'Староста' : 'Замстароста'}
                         </span>
                       </div>
 
@@ -2682,7 +3182,7 @@ function App() {
                               </span>
                             </div>
                             <span className="text-[11px] text-emerald-600 dark:text-emerald-400 font-semibold">
-                              ✓ Разослано всем ({msg.deliveredCount}/{members.length} чел.)
+                              ✓ Доставлено: {msg.deliveredCount} из {msg.totalCount ?? members.length} чел.
                             </span>
                           </div>
 
@@ -2878,12 +3378,12 @@ function App() {
                                             </span>
                                             <span
                                               className={`text-[10px] px-1.5 py-0.5 rounded font-semibold ${
-                                                hw.targetWeekScope === 'next'
+                                                hwScopeOf(hw) === 'next'
                                                   ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
                                                   : 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
                                               }`}
                                             >
-                                              {hw.targetWeekScope === 'next'
+                                              {hwScopeOf(hw) === 'next'
                                                 ? 'На след. неделю'
                                                 : 'На эту неделю'}
                                             </span>
@@ -2966,7 +3466,7 @@ function App() {
                   </button>
                 </div>
 
-                {homeworks.filter((h) => h.targetWeekScope === 'next').length ===
+                {homeworks.filter((h) => hwScopeOf(h) === 'next').length ===
                 0 ? (
                   <div
                     className={`p-6 rounded-xl border border-dashed text-center text-xs space-y-2 ${
@@ -2980,7 +3480,10 @@ function App() {
                       schedule.length > 0 && (
                         <button
                           onClick={() =>
-                            openAddHomeworkModal(schedule[0], 'next')
+                            openAddHomeworkModal(
+                              schedule.find((x) => x.weekType === nextAcademicWeekType) || schedule[0],
+                              'next'
+                            )
                           }
                           className="text-[#2688EB] font-bold hover:underline"
                         >
@@ -3410,12 +3913,12 @@ function App() {
                                         </span>
                                         <span
                                           className={`text-[11px] px-2 py-0.5 rounded-full font-semibold ${
-                                            hw.targetWeekScope === 'next'
+                                            hwScopeOf(hw) === 'next'
                                               ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
                                               : 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
                                           }`}
                                         >
-                                          {hw.targetWeekScope === 'next'
+                                          {hwScopeOf(hw) === 'next'
                                             ? 'На следующую неделю'
                                             : 'На текущую неделю'}
                                         </span>
@@ -3664,7 +4167,7 @@ function App() {
                             if (hw.scheduleId !== pair.id) return false;
                             if (
                               hwTabScope !== 'all' &&
-                              hw.targetWeekScope !== hwTabScope
+                              hwScopeOf(hw) !== hwTabScope
                             )
                               return false;
                             const isDone = hw.completedBy.includes(
@@ -3777,12 +4280,12 @@ function App() {
                                               </span>
                                               <span
                                                 className={`text-[10px] px-2 py-0.5 rounded-full font-semibold ${
-                                                  hw.targetWeekScope === 'next'
+                                                  hwScopeOf(hw) === 'next'
                                                     ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
                                                     : 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
                                                 }`}
                                               >
-                                                {hw.targetWeekScope === 'next'
+                                                {hwScopeOf(hw) === 'next'
                                                   ? 'След. неделя'
                                                   : 'Текущая неделя'}
                                               </span>
@@ -3954,7 +4457,7 @@ function App() {
                             {m.role === 'starosta'
                               ? 'Староста (неизменно)'
                               : m.role === 'deputy'
-                              ? 'Замстаросты (неизменно)'
+                              ? 'Замстароста (неизменно)'
                               : isDailyDep
                               ? 'Назначен на день'
                               : hasHwAccess
@@ -4006,34 +4509,90 @@ function App() {
                   Должности старосты и заместителя старосты закреплены за группой постоянно. Им обоим доступна рассылка важных сообщений от имени бота.
                 </p>
 
-                <div className="space-y-2 pt-1">
+                <div className="space-y-2.5 pt-1">
+                  {/* Starosta Card with ability to set/update Starosta FIO after group creation */}
                   <div
-                    className={`p-3 rounded-xl border flex items-center justify-between ${
+                    className={`p-3 rounded-xl border space-y-2 ${
                       darkMode
                         ? 'bg-slate-800/60 border-slate-700'
                         : 'bg-blue-50/50 border-blue-200/80'
                     }`}
                   >
-                    <div className="flex items-center gap-2.5">
+                    <div className="flex items-center justify-between gap-2">
                       <div
-                        className={`w-9 h-9 rounded-full text-white font-bold flex items-center justify-center ${permanentStarostaMember.avatarColor}`}
+                        onClick={() => openStudentProfile(permanentStarostaMember.id)}
+                        className="flex items-center gap-2.5 cursor-pointer hover:opacity-80"
                       >
-                        {permanentStarostaMember.name[0]}
+                        <div
+                          className={`w-9 h-9 rounded-full text-white font-bold flex items-center justify-center ${permanentStarostaMember.avatarColor}`}
+                        >
+                          {permanentStarostaMember.name[0]}
+                        </div>
+                        <div>
+                          <div className="font-bold text-xs sm:text-sm underline decoration-dotted">
+                            {permanentStarostaMember.name}
+                          </div>
+                          <div className="text-[11px] text-slate-500">
+                            {permanentStarostaMember.vkTag} • Староста группы
+                          </div>
+                        </div>
                       </div>
-                      <div>
-                        <div className="font-bold text-xs sm:text-sm">
-                          {permanentStarostaMember.name}
-                        </div>
-                        <div className="text-[11px] text-slate-500">
-                          {permanentStarostaMember.vkTag} • Выбирает замену на день
-                        </div>
+                      <div className="flex items-center gap-1.5">
+                        {currentUser.role === 'starosta' && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setStarostaNameDraft(permanentStarostaMember.name);
+                              setEditingStarostaName(!editingStarostaName);
+                            }}
+                            className="p-1.5 rounded-lg bg-[#2688EB]/15 text-[#2688EB] hover:bg-[#2688EB]/25"
+                            title="Указать или изменить ФИО старосты"
+                          >
+                            <Edit3 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                        <span className="px-2.5 py-1 rounded-lg bg-[#2688EB] text-white text-xs font-bold">
+                          Староста
+                        </span>
                       </div>
                     </div>
-                    <span className="px-2.5 py-1 rounded-lg bg-[#2688EB] text-white text-xs font-bold">
-                      Староста
-                    </span>
+
+                    {editingStarostaName && currentUser.role === 'starosta' && (
+                      <div className="flex items-center gap-2 pt-1">
+                        <input
+                          type="text"
+                          value={starostaNameDraft}
+                          onChange={(e) => setStarostaNameDraft(e.target.value)}
+                          placeholder="Введите ФИО старосты"
+                          className={`flex-1 px-2.5 py-1.5 rounded-lg border text-xs font-semibold ${
+                            darkMode
+                              ? 'bg-slate-900 border-slate-700 text-white'
+                              : 'bg-white border-slate-200 text-slate-900'
+                          }`}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!starostaNameDraft.trim()) return;
+                            setMembers((prev) =>
+                              prev.map((m) =>
+                                m.role === 'starosta'
+                                  ? { ...m, name: starostaNameDraft.trim() }
+                                  : m
+                              )
+                            );
+                            setEditingStarostaName(false);
+                            showToast('ФИО старосты сохранено!');
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-[#2688EB] text-white text-xs font-bold"
+                        >
+                          Сохранить
+                        </button>
+                      </div>
+                    )}
                   </div>
 
+                  {/* Deputy Starosta Card: can be selected from joined students or added manually after group creation */}
                   {permanentDeputyMember.id !== 'deputy_placeholder' ? (
                     <div
                       className={`p-3 rounded-xl border flex items-center justify-between gap-2 ${
@@ -4062,7 +4621,7 @@ function App() {
                       </div>
                       <div className="flex items-center gap-1.5">
                         <span className="px-2.5 py-1 rounded-lg bg-purple-600 text-white text-xs font-bold">
-                          Замстаросты
+                          Замстароста
                         </span>
                         {currentUser.role === 'starosta' && (
                           <button
@@ -4080,39 +4639,115 @@ function App() {
                     </div>
                   ) : (
                     <div
-                      className={`p-3 rounded-xl border border-dashed text-xs space-y-2 ${
+                      className={`p-3 rounded-xl border border-dashed text-xs space-y-2.5 ${
                         darkMode
-                          ? 'border-slate-700 text-slate-400'
-                          : 'border-purple-300 text-slate-600'
+                          ? 'border-slate-700 text-slate-300'
+                          : 'border-purple-300 text-slate-700'
                       }`}
                     >
-                      <div>Заместитель старосты удален или не назначен.</div>
-                      {currentUser.role === 'starosta' &&
-                        members.filter((m) => m.role !== 'starosta').length > 0 && (
-                          <select
-                            defaultValue=""
-                            onChange={(e) => {
-                              if (e.target.value)
-                                assignNewDeputyByStarosta(e.target.value);
-                            }}
-                            className={`w-full px-2.5 py-1.5 rounded-lg border font-semibold ${
-                              darkMode
-                                ? 'bg-slate-800 border-slate-700 text-white'
-                                : 'bg-white border-slate-200 text-slate-900'
-                            }`}
-                          >
-                            <option value="">
-                              + Назначить нового замстаросты из группы...
-                            </option>
-                            {members
-                              .filter((m) => m.role !== 'starosta')
-                              .map((m) => (
-                                <option key={m.id} value={m.id}>
-                                  {m.name} ({m.subgroup} подгр.)
-                                </option>
-                              ))}
-                          </select>
-                        )}
+                      <div className="font-semibold text-purple-600 dark:text-purple-400">
+                        Заместитель старосты еще не добавлен
+                      </div>
+                      {currentUser.role === 'starosta' && (
+                        <div className="space-y-2">
+                          {members.filter((m) => m.role !== 'starosta').length > 0 && (
+                            <select
+                              defaultValue=""
+                              onChange={(e) => {
+                                if (e.target.value)
+                                  assignNewDeputyByStarosta(e.target.value);
+                              }}
+                              className={`w-full px-2.5 py-1.5 rounded-lg border font-semibold ${
+                                darkMode
+                                  ? 'bg-slate-800 border-slate-700 text-white'
+                                  : 'bg-white border-slate-200 text-slate-900'
+                              }`}
+                            >
+                              <option value="">
+                                Выбрать замстаросту из участников группы...
+                              </option>
+                              {members
+                                .filter((m) => m.role !== 'starosta')
+                                .map((m) => (
+                                  <option key={m.id} value={m.id}>
+                                    {m.name} ({m.subgroup} подгр.)
+                                  </option>
+                                ))}
+                            </select>
+                          )}
+
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <input
+                              type="text"
+                              value={deputyAddForm.name}
+                              onChange={(e) =>
+                                setDeputyAddForm({
+                                  ...deputyAddForm,
+                                  name: e.target.value,
+                                })
+                              }
+                              placeholder="Или введите ФИО замстаросты"
+                              className={`flex-1 min-w-[140px] px-2.5 py-1.5 rounded-lg border ${
+                                darkMode
+                                  ? 'bg-slate-800 border-slate-700 text-white'
+                                  : 'bg-white border-slate-200 text-slate-900'
+                              }`}
+                            />
+                            <input
+                              type="text"
+                              value={deputyAddForm.vkTag}
+                              onChange={(e) =>
+                                setDeputyAddForm({
+                                  ...deputyAddForm,
+                                  vkTag: e.target.value,
+                                })
+                              }
+                              placeholder="@id..."
+                              className={`w-24 px-2.5 py-1.5 rounded-lg border ${
+                                darkMode
+                                  ? 'bg-slate-800 border-slate-700 text-white'
+                                  : 'bg-white border-slate-200 text-slate-900'
+                              }`}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (!deputyAddForm.name.trim()) {
+                                  showToast('Введите ФИО замстаросты');
+                                  return;
+                                }
+                                const depObj = {
+                                  id: 'u2',
+                                  groupCode: groupInfo?.code || '',
+                                  name: deputyAddForm.name.trim(),
+                                  vkTag:
+                                    deputyAddForm.vkTag.trim() || '@deputy',
+                                  subgroup: 1,
+                                  role: 'deputy',
+                                  avatarColor: 'bg-purple-600',
+                                  permissions: {
+                                    canManageHomework: true,
+                                    canMarkAttendance: true,
+                                    canEditSchedule: true,
+                                    canManageQueues: true,
+                                    canPostAnnouncements: true,
+                                  },
+                                };
+                                setMembers((prev) => [...prev, depObj]);
+                                setDeputyAddForm({
+                                  name: '',
+                                  vkTag: '',
+                                  subgroup: 1,
+                                });
+                                showToast('Заместитель старосты добавлен в группу!');
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-700 text-white font-bold"
+                            >
+                              + Добавить
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -4239,6 +4874,7 @@ function App() {
                     <input
                       type="checkbox"
                       checked={dailyDeputyPermissions.canManageHomework}
+                      disabled={currentUser.role !== 'starosta'}
                       onChange={(e) =>
                         setDailyDeputyPermissions((prev) => ({
                           ...prev,
@@ -4253,6 +4889,7 @@ function App() {
                     <input
                       type="checkbox"
                       checked={dailyDeputyPermissions.canMarkAttendance}
+                      disabled={currentUser.role !== 'starosta'}
                       onChange={(e) =>
                         setDailyDeputyPermissions((prev) => ({
                           ...prev,
@@ -4362,7 +4999,7 @@ function App() {
                               {m.role === 'starosta'
                                 ? 'Староста (пост.)'
                                 : m.role === 'deputy'
-                                ? 'Замстаросты (пост.)'
+                                ? 'Замстароста (пост.)'
                                 : dailyDeputyByDay[selectedDay] === m.id
                                 ? 'Назначен на день'
                                 : 'Участник'}
@@ -4481,7 +5118,7 @@ function App() {
                           <Clock className="w-3.5 h-3.5" />
                         )}
                         <span>
-                          Замстаросты ({permanentDeputyMember.name}):{' '}
+                          Замстароста ({permanentDeputyMember.name}):{' '}
                           {deleteConfirmations.deputy
                             ? 'Подтверждено'
                             : 'Ожидается подтверждение'}
@@ -4514,7 +5151,7 @@ function App() {
                         ? 'Отменить подтверждение замстаросты'
                         : deleteConfirmations.starosta
                         ? 'Подтвердить и удалить группу (2/2)'
-                        : 'Удалить группу (подтвердить как Замстаросты 1/2)'}
+                        : 'Удалить группу (подтвердить как замстароста 1/2)'}
                     </button>
                     <span className="text-[11px] text-slate-400">
                       Подтверждено:{' '}
@@ -4571,6 +5208,17 @@ function App() {
                     ))}
                   </select>
 
+                  <input
+                    type="date"
+                    value={attendanceDate}
+                    onChange={(e) => setAttendanceDate(e.target.value || todayISO())}
+                    className={`px-3 py-2 rounded-xl border text-xs font-semibold ${
+                      darkMode
+                        ? 'bg-slate-800 border-slate-700 text-white'
+                        : 'bg-slate-50 border-slate-200 text-slate-900'
+                    }`}
+                    title="Дата занятия: отметки хранятся отдельно для каждой даты"
+                  />
                   <button
                     onClick={() => markAllPresent(attendanceSelectedPairId)}
                     className="px-3 py-2 rounded-xl bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700"
@@ -4612,7 +5260,7 @@ function App() {
                 <div className="space-y-2">
                   {members.map((m) => {
                     const status =
-                      attendance[`${attendanceSelectedPairId}_${m.id}`] ||
+                      attendance[`${attendanceDate}|${attendanceSelectedPairId}|${m.id}`] ||
                       'present';
                     return (
                       <div
@@ -4643,7 +5291,7 @@ function App() {
                               )}
                               {m.role === 'deputy' && (
                                 <span className="text-[10px] px-1.5 py-0.2 rounded bg-purple-500/15 text-purple-500">
-                                  Замстаросты
+                                  Замстароста
                                 </span>
                               )}
                             </div>
@@ -4815,14 +5463,13 @@ function App() {
                             </button>
 
                             {effectivePermissions.canManageQueues && (
+                              <>
                               <button
                                 onClick={() => {
                                   setQueues((prev) =>
                                     prev.map((item) => {
                                       if (item.id !== q.id) return item;
-                                      const shuffled = [...item.entries].sort(
-                                        () => Math.random() - 0.5
-                                      );
+                                      const shuffled = shuffleArray(item.entries);
                                       return { ...item, entries: shuffled };
                                     })
                                   );
@@ -4835,6 +5482,17 @@ function App() {
                               >
                                 <Shuffle className="w-3.5 h-3.5" />
                               </button>
+                              <button
+                                onClick={() => {
+                                  setQueues((prev) => prev.filter((item) => item.id !== q.id));
+                                  showToast('Очередь удалена');
+                                }}
+                                className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-500/10"
+                                title="Удалить очередь"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                              </>
                             )}
                           </div>
                         </div>
@@ -4847,8 +5505,7 @@ function App() {
                           ) : (
                             q.entries.map((entry, idx) => {
                               const st =
-                                members.find((m) => m.id === entry.userId) ||
-                                currentUser;
+                                members.find((m) => m.id === entry.userId) || { name: 'Бывший участник' };
                               return (
                                 <div
                                   key={entry.userId}
@@ -4872,17 +5529,32 @@ function App() {
                                       {st.name}
                                     </span>
                                   </div>
-                                  <span
+                                  <button
+                                    type="button"
+                                    disabled={!effectivePermissions.canManageQueues}
+                                    onClick={() =>
+                                      setQueues((prev) =>
+                                        prev.map((item) =>
+                                          item.id !== q.id
+                                            ? item
+                                            : {
+                                                ...item,
+                                                entries: item.entries.map((e) =>
+                                                  e.userId === entry.userId
+                                                    ? { ...e, status: e.status === 'done' ? 'waiting' : 'done' }
+                                                    : e
+                                                ),
+                                              }
+                                        )
+                                      )
+                                    }
+                                    title={effectivePermissions.canManageQueues ? 'Нажмите, чтобы отметить сдачу' : ''}
                                     className={`text-[11px] font-semibold ${
-                                      entry.status === 'done'
-                                        ? 'text-emerald-500'
-                                        : 'text-amber-500'
-                                    }`}
+                                      entry.status === 'done' ? 'text-emerald-500' : 'text-amber-500'
+                                    } ${effectivePermissions.canManageQueues ? 'underline decoration-dotted' : ''}`}
                                   >
-                                    {entry.status === 'done'
-                                      ? 'Сдал(а)'
-                                      : 'Ожидает'}
-                                  </span>
+                                    {entry.status === 'done' ? 'Сдал(а)' : 'Ожидает'}
+                                  </button>
                                 </div>
                               );
                             })
@@ -4989,6 +5661,19 @@ function App() {
                           >
                             {isPaid ? '✓ Оплачено' : 'Отметить оплату'}
                           </button>
+                          {effectivePermissions.canPostAnnouncements && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setFunds((prev) => prev.filter((item) => item.id !== f.id));
+                                showToast('Сбор удалён');
+                              }}
+                              className="p-1.5 rounded-lg text-rose-500 hover:bg-rose-500/10"
+                              title="Удалить сбор"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                         </div>
                       </div>
                     );
@@ -5117,7 +5802,7 @@ function App() {
                   <button
                     type="button"
                     onClick={() =>
-                      setHwModal({ ...hwModal, targetWeekScope: 'current' })
+                      chooseHwScope('current')
                     }
                     className={`py-2 px-3 rounded-xl border font-semibold text-xs ${
                       hwModal.targetWeekScope === 'current'
@@ -5134,7 +5819,7 @@ function App() {
                   <button
                     type="button"
                     onClick={() =>
-                      setHwModal({ ...hwModal, targetWeekScope: 'next' })
+                      chooseHwScope('next')
                     }
                     className={`py-2 px-3 rounded-xl border font-semibold text-xs ${
                       hwModal.targetWeekScope === 'next'
@@ -5164,7 +5849,15 @@ function App() {
                       : 'bg-slate-50 border-slate-200'
                   }`}
                 >
-                  {schedule.map((s) => (
+                  {schedule
+                    .filter(
+                      (s) =>
+                        s.weekType ===
+                        (hwModal.targetWeekScope === 'next'
+                          ? nextAcademicWeekType
+                          : currentAcademicWeekType)
+                    )
+                    .map((s) => (
                     <option key={s.id} value={s.id}>
                       [{s.weekType === 'numerator' ? 'Числитель' : 'Знаменатель'} •{' '}
                       {DAYS.find((d) => d.id === s.day)?.short}] {s.pairNumber} пара —{' '}
@@ -5838,10 +6531,14 @@ function App() {
           const student = members.find((m) => m.id === selectedStudentProfileId);
           if (!student) return null;
 
-          const studentScheduleStats = schedule.map((pair) => {
-            const st = attendance[`${pair.id}_${student.id}`] || 'present';
-            return { pair, status: st };
-          });
+          const studentScheduleStats = Object.entries(attendance)
+            .filter(([k]) => k.endsWith('|' + student.id))
+            .map(([k, st]) => {
+              const [date, pairId] = k.split('|');
+              return { pair: schedule.find((p) => p.id === pairId), date, status: st };
+            })
+            .filter((x) => x.pair)
+            .sort((a, b) => b.date.localeCompare(a.date));
 
           const absentList = studentScheduleStats.filter((x) => x.status === 'absent');
           const lateList = studentScheduleStats.filter((x) => x.status === 'late');
@@ -5899,7 +6596,7 @@ function App() {
                         </span>
                       </div>
                       <p className="text-xs text-slate-500 mt-0.5">
-                        Личная карточка участника • Доступна только самому студенту, старосте и замстаросты
+                        Личная карточка участника • Доступна только самому студенту, старосте и замстаросте
                       </p>
                     </div>
                   </div>
@@ -5979,15 +6676,14 @@ function App() {
                           : 'bg-slate-50 border-slate-200'
                       }`}
                     >
-                      {studentScheduleStats.map(({ pair, status }) => (
+                      {studentScheduleStats.map(({ pair, status, date }) => (
                         <div
-                          key={pair.id}
+                          key={`${pair.id}-${date}`}
                           className="flex items-center justify-between gap-2 py-1 border-b last:border-b-0 border-slate-200/60 dark:border-slate-700/60"
                         >
                           <div>
                             <span className="font-semibold text-[#2688EB]">
-                              [{pair.weekType === 'numerator' ? 'Числ.' : 'Знам.'} •{' '}
-                              {DAYS.find((d) => d.id === pair.day)?.short}]
+                              [{date} • {DAYS.find((d) => d.id === pair.day)?.short}]
                             </span>{' '}
                             <span className="font-medium">{pair.subject}</span>{' '}
                             <span className="text-slate-400">({pair.time})</span>
